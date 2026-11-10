@@ -10,6 +10,9 @@ const (
 	KeySandboxMode                 = "sandbox-mode"
 	KeyTerminalTTLDays             = "terminal-ttl-days"
 	KeySandboxPodSpec              = "sandbox-pod-spec"
+	KeySandboxCredentialMode       = "sandbox-credential-mode"
+	KeyGatewayServerURLTemplate    = "gateway-server-url-template"
+	KeyGatewayCASecret             = "gateway-ca-secret"
 	KeyToolOutputInspectionEnabled = "tool-output-inspection-enabled"
 	KeyTLSProfile                  = "tls-profile"
 	KeyTLSMinVersion               = "tls-min-version"
@@ -36,4 +39,14 @@ const (
 	ErrCreateLogExporter     = "create OTLP log exporter"
 	ErrCreateDeleteRequest   = "create delete request"
 	ErrDeleteLogs            = "delete logs"
+	ErrInvalidCredentialMode = "invalid sandbox-credential-mode"
+	ErrMissingGatewayConfig  = "gateway credential mode is missing required configuration"
+
+	// Sandbox credential modes (sandbox-credential-mode key).
+	// CredentialModeSpokeSA is the default: the operator requests a per-step
+	// spoke SA token and embeds it in the sandbox kubeconfig.
+	CredentialModeSpokeSA = "spoke-sa"
+	// CredentialModeGateway routes sandbox spoke traffic through a hub-local
+	// policy gateway performing an RFC 8693 token exchange per call.
+	CredentialModeGateway = "gateway"
 )

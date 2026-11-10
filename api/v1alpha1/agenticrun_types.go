@@ -54,6 +54,13 @@ const (
 // so it is intentionally outside the console SYNC block above.
 const ReasonVerificationFailed = "VerificationFailed"
 
+// ReasonCredentialsExpired is the reason set on the CredentialsExpired
+// condition when the run's spoke credential is missing, mislabeled, or was
+// rejected and the run is paused waiting for renewal. It is a cross-file
+// contract: the controller writes it and the external A2A adapter maps it to
+// AUTH_REQUIRED. Not consumed by DerivePhase.
+const ReasonCredentialsExpired = "CredentialsExpired"
+
 // DerivePhase computes the display phase from conditions. Conditions are
 // the source of truth; this function maps them to a human-friendly phase
 // for display in CLI, console, and controller routing.
@@ -256,6 +263,18 @@ const (
 	// AgenticRunConditionStopping records accepted stop intent and stop progress.
 	// It does not participate in phase derivation.
 	AgenticRunConditionStopping string = "Stopping"
+	// AgenticRunConditionCredentialsExpired indicates the sandbox's spoke
+	// credential was rejected or expired and the run is paused waiting for a
+	// renewed credential. Status=True while waiting.
+	//
+	// Contract: set only in gateway credential mode (sandbox-credential-mode:
+	// gateway). The external A2A adapter watches this condition to surface
+	// AUTH_REQUIRED to the caller and rewrites the run-token Secret
+	// (ls-run-token-{run UID}, key token-a, bound by the hub.openshift.io/
+	// agentic-run and hub.openshift.io/spoke-cluster labels). The controller
+	// re-attempts the paused step once that Secret's resourceVersion changes.
+	// It does not participate in phase derivation.
+	AgenticRunConditionCredentialsExpired string = "CredentialsExpired"
 )
 
 // AgenticRunStep defines per-step configuration on an AgenticRun. The agent

@@ -153,4 +153,6 @@ graph TB
 
 **Create-only idempotency.** Child resources (AgenticRunApproval, Result CRs, RBAC objects) use `Create` + handle `AlreadyExists` rather than `Get`-then-`Create`, avoiding read-modify-write race conditions.
 
+**Gateway credential mode for spoke runs.** `sandbox-credential-mode: gateway` (see [docs/gateway-credential-mode.md](docs/gateway-credential-mode.md)) routes sandbox→spoke traffic through a hub-local Praxis policy gateway performing an RFC 8693 token exchange per call: the sandbox kubeconfig targets the gateway (serving CA mounted from a configured Secret), and the bearer token is the requester's original token mounted from a run-scoped Secret (`ls-run-token-{run UID}`) written by an external A2A adapter. The operator validates that Secret (existence, key, run/target binding labels) fail-closed before creating the pod, pausing the run via the `CredentialsExpired` condition until the adapter renews it. Management traffic (standing spoke kubeconfig, spoke SA/RBAC) is not rewritten; the default `spoke-sa` mode is unchanged.
+
 **Separate API module.** The `api/` directory is its own Go module so downstream projects can depend on CRD types without importing controller-runtime or the full operator dependency tree.

@@ -132,6 +132,17 @@ func (m *SandboxManager) Create(
 		return "", err
 	}
 
+	// Gateway credential mode: validate the run-token Secret (fail closed)
+	// before any resources are created. A missing, mislabeled, or not-yet-
+	// renewed Secret pauses the run via the CredentialsExpired condition
+	// instead of failing the step — the external A2A adapter rewrites it.
+	gateway := spoke != nil && gatewayCredentialMode(cfg)
+	if gateway {
+		if _, err := validateRunTokenSecret(ctx, m.client, m.namespace, run); err != nil {
+			return "", err
+		}
+	}
+
 	serviceAccount := sandboxSAName(run, step)
 
 	// Register cleanup so that any failure after SA creation cleans up
@@ -145,7 +156,7 @@ func (m *SandboxManager) Create(
 		}
 	}()
 
-	token, err := m.ensureSA(ctx, run, serviceAccount, step, spoke)
+	token, err := m.ensureSA(ctx, run, serviceAccount, step, spoke, !gateway)
 	if err != nil {
 		createErr = err
 		return "", err
@@ -161,7 +172,12 @@ func (m *SandboxManager) Create(
 	}
 
 	if spoke != nil {
-		if err := m.ensureSandboxKubeconfig(ctx, run, step, spoke, token); err != nil {
+		if gateway {
+			if err := m.ensureGatewaySandboxKubeconfig(ctx, run, step, cfg); err != nil {
+				createErr = err
+				return "", err
+			}
+		} else if err := m.ensureSandboxKubeconfig(ctx, run, step, spoke, token); err != nil {
 			createErr = err
 			return "", err
 		}
@@ -238,6 +254,9 @@ func (m *SandboxManager) Create(
 
 	if spoke != nil {
 		mountSpokeKubeconfig(podSpec, sandboxKubeconfigSecretName(string(run.UID), step))
+		if gateway {
+			mountGatewayCredentials(podSpec, cfg.Sandbox.GatewayCASecret, runTokenSecretName(string(run.UID)))
+		}
 	}
 
 	if deadline > 0 {
@@ -299,12 +318,14 @@ func (m *SandboxManager) Create(
 
 // ensureSA creates a per-step ServiceAccount and adds it to reader
 // ClusterRoleBindings. For spoke runs, creates the SA on the spoke cluster
-// with spoke labels, creates per-run CRBs, and requests a 24h bound token
-// via TokenRequest. For hub runs, adds the SA to the shared reader CRBs.
+// with spoke labels, creates per-run CRBs, and, when mintToken is true,
+// requests a 24h bound token via TokenRequest (skipped in gateway credential
+// mode, where the sandbox authenticates through the policy gateway with the
+// requester's token). For hub runs, adds the SA to the shared reader CRBs.
 // Idempotent.
 //
-// Returns the spoke token (non-empty for spoke, empty for hub).
-func (m *SandboxManager) ensureSA(ctx context.Context, run *agenticv1alpha1.AgenticRun, saName, step string, spoke *SpokeAccess) (string, error) {
+// Returns the spoke token (non-empty for spoke with mintToken, empty otherwise).
+func (m *SandboxManager) ensureSA(ctx context.Context, run *agenticv1alpha1.AgenticRun, saName, step string, spoke *SpokeAccess, mintToken bool) (string, error) {
 	if spoke != nil {
 		// spoke path: SA on spoke with spoke-specific labels
 		sa := &corev1.ServiceAccount{
@@ -330,6 +351,12 @@ func (m *SandboxManager) ensureSA(ctx context.Context, run *agenticv1alpha1.Agen
 		}
 		// Request a 24h bound token for the spoke SA. This token is embedded
 		// in the sandbox kubeconfig Secret so the pod can target the spoke.
+		// Skipped in gateway credential mode: the sandbox authenticates to the
+		// spoke through the hub-local Praxis policy gateway with the
+		// requester's token instead.
+		if !mintToken {
+			return "", nil
+		}
 		token, err := requestSpokeToken(ctx, spoke.Config, saName, spoke.Namespace)
 		if err != nil {
 			return "", err
@@ -371,6 +398,27 @@ func (m *SandboxManager) ensureSandboxKubeconfig(ctx context.Context, run *agent
 	if err != nil {
 		return err
 	}
+	return m.upsertSandboxKubeconfigSecret(ctx, run, step, kubeconfigData)
+}
+
+// ensureGatewaySandboxKubeconfig creates or refreshes the hub Secret holding
+// the gateway kubeconfig. Same Secret machinery as spoke-sa mode (name,
+// labels, owner refs); only the content differs — the server is the Praxis
+// gateway (URL template substituted with the run's targetCluster), the CA is
+// the gateway's serving CA mounted in the pod, and the bearer token is read
+// from the run-identity token file at request time, so no token is embedded.
+func (m *SandboxManager) ensureGatewaySandboxKubeconfig(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string, cfg *configuration.Config) error {
+	kubeconfigData, err := buildGatewaySandboxKubeconfig(cfg.Sandbox.GatewayServerURLTemplate, run.Spec.TargetCluster)
+	if err != nil {
+		return err
+	}
+	return m.upsertSandboxKubeconfigSecret(ctx, run, step, kubeconfigData)
+}
+
+// upsertSandboxKubeconfigSecret creates the per-step sandbox kubeconfig
+// Secret, or refreshes its data on retry (AlreadyExists) so the pod mounts
+// fresh content.
+func (m *SandboxManager) upsertSandboxKubeconfigSecret(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string, kubeconfigData []byte) error {
 	kcSecretName := sandboxKubeconfigSecretName(string(run.UID), step)
 	kcSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -553,6 +601,11 @@ func (m *SandboxManager) createBarePod(
 		},
 		Spec: *podSpec,
 	}
+	// Trusted-target labels (gateway credential mode only): bind the sandbox
+	// pod to its run and target cluster for policy enforcement.
+	for k, v := range trustedTargetLabels(m.config.Get(), run) {
+		pod.Labels[k] = v
+	}
 
 	if _, err := m.requireRunnableRun(ctx, run); err != nil {
 		return "", "", err
@@ -633,10 +686,19 @@ func (m *SandboxManager) createSandboxClaim(
 				"networkPolicyManagement": "Unmanaged",
 				"podTemplate": map[string]any{
 					"metadata": map[string]any{
-						"labels": map[string]any{
-							LabelRun:  string(run.UID),
-							LabelStep: step,
-						},
+						"labels": func() map[string]any {
+							labels := map[string]any{
+								LabelRun:  string(run.UID),
+								LabelStep: step,
+							}
+							// Trusted-target labels (gateway credential mode
+							// only): bind the sandbox pod to its run and
+							// target cluster for policy enforcement.
+							for k, v := range trustedTargetLabels(m.config.Get(), run) {
+								labels[k] = v
+							}
+							return labels
+						}(),
 						"annotations": map[string]any{
 							AnnotationRunName: run.Name,
 						},

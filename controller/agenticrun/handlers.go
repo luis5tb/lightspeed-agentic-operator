@@ -391,9 +391,14 @@ func (r *AgenticRunReconciler) handleFailed(
 		return ctrl.Result{}, nil
 	}
 
-	spoke, spokeErr := spokeAccessForRun(ctx, r.Client, run, r.Namespace)
+	spoke, spokeErr := spokeManagementAccess(ctx, r.Client, run, r.Namespace, configFrom(r.Config))
 	if spokeErr != nil {
 		log.Error(spokeErr, "RBAC cleanup: spoke unreachable")
+	}
+	// Gateway-mode spoke runs created nothing on the spoke, and the loop below
+	// would treat a nil spoke as a hub run: nothing to clean.
+	if isSpokeRun(run) && spoke == nil && spokeErr == nil {
+		return ctrl.Result{}, nil
 	}
 
 	// Clean SAs, reader CRBs, and execution RBAC for all steps.

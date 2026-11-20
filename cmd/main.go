@@ -177,6 +177,7 @@ func main() {
 		APIReader: apiReader,
 		Namespace: namespace,
 		Audit:     auditLogger,
+		Config:    cfgCache,
 	}
 
 	// --- Register controllers ---

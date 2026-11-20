@@ -32,17 +32,44 @@ gateway** that performs an RFC 8693 token exchange per call:
 Required configuration (ConfigMap load fails loudly when missing):
 `gateway-server-url-template` and `gateway-ca-secret`.
 
+## No spoke management in gateway mode
+
+The sandbox acts as the **requester** (Token A, exchanged per call by the
+gateway), so the spoke's own RBAC for that identity decides what it may do.
+The operator therefore does **no management on the spoke** for gateway-mode
+runs (`spokeManagementAccess` in `controller/agenticrun/gateway.go`):
+
+- the standing `spoke-kubeconfig-{targetCluster}` Secret is **not read** and
+  need not exist;
+- **no per-step ServiceAccount** is created (not on the spoke, not on the hub);
+  the sandbox pod runs as the namespace `default` SA, used only to write its
+  Result CR to the hub;
+- **no per-run reader ClusterRoleBindings** are created, so the spoke needs no
+  `openshift-lightspeed-managed` namespace and no `lightspeed-hub:*` reader
+  bindings;
+- **execution**: the approved option's RBAC is **not materialized**. Execution
+  is bounded by the requester's own permissions on the spoke (logged at Info
+  when an approved option carries RBAC);
+- failure, release and terminal cleanup skip spoke RBAC cleanup (nothing was
+  created) and still delete the hub-side sandbox kubeconfig Secret.
+
+Authorization on the spoke comes from bindings for the requester's identity,
+e.g. `cluster-reader` bound to the group the exchanged token carries.
+
+**Why:** the earlier gateway implementation kept the spoke-sa management
+path. It created a per-step spoke SA and reader bindings that the sandbox
+never used (it never got their token), but still required a standing
+admin-capable spoke credential, and left a dormant read-privileged SA per
+run. Found live (2026-11-20): the first gateway runs failed cleanup on a
+missing `spoke-kubeconfig-hub`.
+
 ## What does NOT change
 
-- **Management kubeconfigs are not rewritten.** The standing
-  `spoke-kubeconfig-{targetCluster}` Secret still drives SA/RBAC creation and
-  cleanup on the spoke via the spoke client. Only the sandbox *execution*
-  kubeconfig is rewritten to the gateway.
-- The per-step spoke SA and per-run reader ClusterRoleBindings are still
-  created on the spoke; only the TokenRequest for the sandbox token is
-  skipped.
 - Hub runs and the stock `spoke-sa` mode are byte-identical when the new keys
-  are absent (the default).
+  are absent (the default). Spoke-sa mode still reads the standing
+  `spoke-kubeconfig-{targetCluster}` Secret, creates the per-step spoke SA and
+  per-run reader ClusterRoleBindings, and mints the sandbox token via
+  TokenRequest.
 
 ## Token renewal
 

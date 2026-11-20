@@ -9,6 +9,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -302,13 +304,12 @@ func TestCreate_GatewaySpokeRun(t *testing.T) {
 	origClient := NewClientFromConfig
 	origClientset := NewClientsetFromConfig
 
-	srcBindings := spokeReaderBindings()
-	spokeFC := fake.NewClientBuilder().WithScheme(testScheme()).
-		WithObjects(srcBindings[0], srcBindings[1]).Build()
+	// Gateway mode does NO spoke management: no spoke client is ever built
+	// and the spoke TokenRequest API is never called.
 	NewClientFromConfig = func(cfg *rest.Config) (client.Client, error) {
-		return spokeFC, nil
+		t.Error("no spoke management client may be built in gateway credential mode")
+		return nil, fmt.Errorf("unexpected spoke client in gateway mode")
 	}
-	// The spoke TokenRequest API must never be called in gateway mode.
 	NewClientsetFromConfig = func(cfg *rest.Config) (kubernetes.Interface, error) {
 		t.Error("requestSpokeToken must not be called in gateway credential mode")
 		return nil, fmt.Errorf("unexpected TokenRequest in gateway mode")
@@ -320,8 +321,10 @@ func TestCreate_GatewaySpokeRun(t *testing.T) {
 
 	cache := testGatewayCache(t)
 	run := testSpokeRun()
+	// Deliberately NO spoke-kubeconfig-{targetCluster} Secret: gateway mode
+	// needs no standing management credential for the spoke.
 	hubFC := fake.NewClientBuilder().WithScheme(testScheme()).
-		WithObjects(testReaderCRB(), testSpokeKubeconfigSecret(), testRunTokenSecret(run, "101")).
+		WithObjects(testReaderCRB(), testRunTokenSecret(run, "101")).
 		Build()
 	mgr := newTestSandboxManager(hubFC, cache)
 
@@ -330,11 +333,21 @@ func TestCreate_GatewaySpokeRun(t *testing.T) {
 		t.Fatalf("Create gateway spoke run failed: %v", err)
 	}
 
-	// SA still created on the spoke (management path unchanged).
+	// No per-step ServiceAccount anywhere (not even on the hub).
 	saName := sandboxSAName(run, "analysis")
 	var sa corev1.ServiceAccount
-	if err := spokeFC.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: spokeManagedNamespace}, &sa); err != nil {
-		t.Fatalf("spoke SA not found: %v", err)
+	if err := hubFC.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "test-ns"}, &sa); !apierrors.IsNotFound(err) {
+		t.Errorf("gateway mode must not create a per-step SA on the hub, got err=%v", err)
+	}
+	// The shared hub reader CRB was not extended with a gateway-run subject.
+	var crb rbacv1.ClusterRoleBinding
+	if err := hubFC.Get(context.Background(), types.NamespacedName{Name: testReaderCRB().Name}, &crb); err != nil {
+		t.Fatalf("reader CRB: %v", err)
+	}
+	for _, s := range crb.Subjects {
+		if s.Name == saName {
+			t.Errorf("gateway run SA %q added to reader CRB %q", saName, crb.Name)
+		}
 	}
 
 	// Kubeconfig Secret exists, points at the gateway, embeds no token.
@@ -777,4 +790,46 @@ func stampCredentialsExpired(t *testing.T, run *agenticv1alpha1.AgenticRun, rv s
 		Reason:  agenticv1alpha1.ReasonCredentialsExpired,
 		Message: fmt.Sprintf("run credential Secret not ready (observed resourceVersion %q)", rv),
 	})
+}
+
+// Gateway mode needs no spoke management credential on teardown either:
+// releasing a gateway spoke run's sandbox must succeed without the
+// spoke-kubeconfig-{targetCluster} Secret (it created nothing on the spoke),
+// while spoke-sa mode still reports the missing management credential.
+// Live finding (2026-11-20): before this, failure/terminal cleanup of every
+// gateway run logged `get spoke kubeconfig Secret spoke-kubeconfig-hub:
+// not found`, and ReleaseSandbox returned that error.
+func TestRelease_GatewaySpokeRun_NoSpokeKubeconfig(t *testing.T) {
+	origClient := NewClientFromConfig
+	NewClientFromConfig = func(cfg *rest.Config) (client.Client, error) {
+		t.Error("no spoke management client may be built in gateway credential mode")
+		return nil, fmt.Errorf("unexpected spoke client in gateway mode")
+	}
+	t.Cleanup(func() { NewClientFromConfig = origClient })
+
+	run := testSpokeRun()
+	run.Status.Steps.Analysis.Sandbox.ClaimName = "ls-analysis-gateway-release"
+	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(run).Build()
+	sandbox := &mockSandboxProvider{}
+	caller := &SandboxAgentCaller{
+		Sandbox: sandbox, K8sClient: fc, APIReader: fc, Namespace: "test-ns",
+		Config: testGatewayCache(t),
+	}
+
+	if err := caller.ReleaseSandbox(context.Background(), run, "analysis"); err != nil {
+		t.Fatalf("gateway ReleaseSandbox without spoke kubeconfig: %v", err)
+	}
+	if err := caller.ReleaseSandboxes(context.Background(), run, false); err != nil {
+		t.Fatalf("gateway ReleaseSandboxes without spoke kubeconfig: %v", err)
+	}
+	if sandbox.releaseCalls == 0 {
+		t.Error("sandbox Release was not called")
+	}
+
+	// spoke-sa mode (nil config) still needs and reports the management credential.
+	NewClientFromConfig = origClient
+	caller.Config = nil
+	if err := caller.ReleaseSandbox(context.Background(), run, "analysis"); err == nil {
+		t.Error("spoke-sa ReleaseSandbox must report the missing spoke kubeconfig")
+	}
 }

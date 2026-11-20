@@ -26,8 +26,10 @@ import (
 // exchange per call: the server is the gateway, the CA is the gateway's
 // serving CA, and the bearer token is the requester's original token (Token A)
 // mounted from a run-scoped Secret written by an external A2A adapter.
-// Management traffic (SA/RBAC creation on the spoke via the standing
-// kubeconfig) is NOT rewritten — only the sandbox execution kubeconfig is.
+// The operator does NO spoke management in this mode (no standing
+// spoke-kubeconfig, no per-step spoke SA, no reader ClusterRoleBindings): the
+// sandbox acts as the requester, so the spoke's own RBAC for that identity
+// applies. See spokeManagementAccess.
 
 const (
 	// runTokenSecretPrefix is the name prefix for run-scoped Secrets holding
@@ -60,6 +62,40 @@ const (
 // through the hub-local Praxis policy gateway.
 func gatewayCredentialMode(cfg *configuration.Config) bool {
 	return cfg != nil && cfg.Sandbox.CredentialMode == configuration.CredentialModeGateway
+}
+
+// spokeManagementAccess returns the operator's MANAGEMENT access to the run's
+// spoke (the standing spoke-kubeconfig-{targetCluster} Secret), or nil when
+// none is needed: hub runs, and spoke runs in gateway credential mode.
+//
+// In gateway mode the sandbox authenticates to the spoke as the requester
+// (Token A, exchanged per call by the Praxis gateway) and the spoke's own
+// RBAC for that identity applies. The per-step spoke ServiceAccount and
+// per-run reader ClusterRoleBindings that spoke-sa mode creates would never
+// be used, so gateway mode creates none of them -- and therefore needs no
+// standing admin credential for the spoke, no openshift-lightspeed-managed
+// namespace and no lightspeed-hub:* reader bindings on it. Spoke-sa mode is
+// unchanged.
+//
+// Callers must not use a nil result to mean "hub run": use isSpokeRun.
+func spokeManagementAccess(ctx context.Context, hubClient client.Client, run *agenticv1alpha1.AgenticRun, operatorNS string, cfg *configuration.Config) (*SpokeAccess, error) {
+	if !isSpokeRun(run) || gatewayCredentialMode(cfg) {
+		return nil, nil
+	}
+	return spokeAccessForRun(ctx, hubClient, run, operatorNS)
+}
+
+// isSpokeRun reports whether the run targets a spoke cluster.
+func isSpokeRun(run *agenticv1alpha1.AgenticRun) bool {
+	return run.Spec.TargetCluster != ""
+}
+
+// configFrom returns the current configuration from a possibly-nil cache.
+func configFrom(c *configuration.Cache) *configuration.Config {
+	if c == nil {
+		return nil
+	}
+	return c.Get()
 }
 
 // runTokenSecretName returns the hub Secret name holding the requester's

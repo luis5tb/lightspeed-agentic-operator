@@ -11,6 +11,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agenticv1alpha1 "github.com/openshift/lightspeed-agentic-operator/api/v1alpha1"
+	"github.com/openshift/lightspeed-agentic-operator/pkg/configuration"
 )
 
 const (
@@ -137,6 +138,9 @@ type SandboxAgentCaller struct {
 	APIReader client.Reader
 	Namespace string
 	Audit     AuditLogger
+	// Config decides whether spoke management access is needed on release
+	// (not in gateway credential mode). nil behaves as spoke-sa mode.
+	Config *configuration.Cache
 }
 
 func stepString(step agenticv1alpha1.SandboxStep) string {
@@ -203,7 +207,7 @@ func (s *SandboxAgentCaller) launchSandbox(
 }
 
 func (s *SandboxAgentCaller) ReleaseSandbox(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string) error {
-	spoke, spokeErr := spokeAccessForRun(ctx, s.K8sClient, run, s.Namespace)
+	spoke, spokeErr := spokeManagementAccess(ctx, s.K8sClient, run, s.Namespace, configFrom(s.Config))
 	if spokeErr != nil {
 		logf.FromContext(ctx).Error(spokeErr, "release: spoke unreachable, skipping spoke cleanup")
 	}
@@ -217,8 +221,9 @@ func (s *SandboxAgentCaller) ReleaseSandboxes(ctx context.Context, run *agenticv
 	log := logf.FromContext(ctx)
 	var firstErr error
 
-	// Resolve spoke access once for the entire teardown.
-	spoke, spokeErr := spokeAccessForRun(ctx, s.K8sClient, run, s.Namespace)
+	// Resolve spoke management access once for the entire teardown (nil for
+	// hub runs and gateway-mode spoke runs, which created nothing on the spoke).
+	spoke, spokeErr := spokeManagementAccess(ctx, s.K8sClient, run, s.Namespace, configFrom(s.Config))
 	if spokeErr != nil {
 		log.Error(spokeErr, "release: spoke unreachable, skipping spoke cleanup")
 		if !apierrors.IsNotFound(spokeErr) || run.DeletionTimestamp.IsZero() {

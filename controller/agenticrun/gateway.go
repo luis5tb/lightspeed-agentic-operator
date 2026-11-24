@@ -78,19 +78,6 @@ func spokeManagementAccess(ctx context.Context, hubClient client.Client, run *ag
 	return spokeAccessForRun(ctx, hubClient, run, operatorNS)
 }
 
-// isSpokeRun reports whether the run targets a spoke cluster.
-func isSpokeRun(run *agenticv1alpha1.AgenticRun) bool {
-	return run.Spec.TargetCluster != ""
-}
-
-// configFrom returns the current configuration from a possibly-nil cache.
-func configFrom(c *configuration.Cache) *configuration.Config {
-	if c == nil {
-		return nil
-	}
-	return c.Get()
-}
-
 // runTokenSecretName returns the hub Secret name holding the requester's
 // original token (Token A) for the run.
 func runTokenSecretName(runUID string) string {

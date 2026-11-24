@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agenticv1alpha1 "github.com/openshift/lightspeed-agentic-operator/api/v1alpha1"
+	"github.com/openshift/lightspeed-agentic-operator/pkg/configuration"
 )
 
 const (
@@ -101,6 +102,19 @@ func spokeLabels(runUID, runName, targetCluster, component string) map[string]st
 // Exported as a variable so tests can inject a fake client.
 var NewClientFromConfig = func(cfg *rest.Config) (client.Client, error) {
 	return client.New(cfg, client.Options{})
+}
+
+// isSpokeRun reports whether the run targets a spoke cluster.
+func isSpokeRun(run *agenticv1alpha1.AgenticRun) bool {
+	return run.Spec.TargetCluster != ""
+}
+
+// configFrom returns the current configuration from a possibly-nil cache.
+func configFrom(c *configuration.Cache) *configuration.Config {
+	if c == nil {
+		return nil
+	}
+	return c.Get()
 }
 
 // spokeAccessForRun returns a SpokeAccess for the run's targetCluster.

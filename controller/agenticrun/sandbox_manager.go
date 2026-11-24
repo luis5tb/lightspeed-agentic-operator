@@ -125,14 +125,37 @@ func (m *SandboxManager) Create(
 
 	span := trace.SpanFromContext(ctx)
 
-	// Resolve spoke access once for the entire Create flow.
-	// nil when targetCluster is empty (hub path — unchanged behavior).
-	spoke, err := spokeAccessForRun(ctx, m.client, run, m.namespace)
+	// spokeRun: the run targets a spoke. gateway: a spoke run whose sandbox
+	// reaches the spoke through the Praxis gateway as the requester.
+	spokeRun := isSpokeRun(run)
+	gateway := spokeRun && gatewayCredentialMode(cfg)
+
+	// Resolve spoke MANAGEMENT access once for the entire Create flow.
+	// nil for hub runs (unchanged behavior) and for gateway-mode spoke runs,
+	// which need no standing spoke credential (see spokeManagementAccess).
+	spoke, err := spokeManagementAccess(ctx, m.client, run, m.namespace, cfg)
 	if err != nil {
 		return "", err
 	}
 
+	// Gateway credential mode: validate the run-token Secret (fail closed)
+	// before any resources are created. A missing, mislabeled, or not-yet-
+	// renewed Secret pauses the run via the CredentialsExpired condition
+	// instead of failing the step — the external A2A adapter rewrites it.
+	if gateway {
+		if _, err := validateRunTokenSecret(ctx, m.client, m.namespace, run); err != nil {
+			return "", err
+		}
+	}
+
+	// Gateway mode creates no per-step ServiceAccount (neither on the spoke
+	// nor on the hub): the pod runs as the namespace "default" SA for hub
+	// Result writes, and spoke access is the requester's own identity. An
+	// empty name also makes cleanupOnCreateFailure skip step-RBAC cleanup.
 	serviceAccount := sandboxSAName(run, step)
+	if gateway {
+		serviceAccount = ""
+	}
 
 	// Register cleanup so that any failure after SA creation cleans up
 	// spoke resources, RBAC, and the SA itself.
@@ -145,10 +168,13 @@ func (m *SandboxManager) Create(
 		}
 	}()
 
-	token, err := m.ensureSA(ctx, run, serviceAccount, step, spoke)
-	if err != nil {
-		createErr = err
-		return "", err
+	var token string
+	if !gateway {
+		token, err = m.ensureSA(ctx, run, serviceAccount, step, spoke, true)
+		if err != nil {
+			createErr = err
+			return "", err
+		}
 	}
 
 	// For spoke runs, the sandbox pod uses the default SA with automount
@@ -156,19 +182,33 @@ func (m *SandboxManager) Create(
 	// Result CRs. Spoke cluster access comes via a mounted kubeconfig
 	// (KUBECONFIG env var). The two credential paths don't conflict.
 	podServiceAccount := serviceAccount
-	if spoke != nil {
+	if spokeRun {
 		podServiceAccount = "default"
 	}
 
-	if spoke != nil {
-		if err := m.ensureSandboxKubeconfig(ctx, run, step, spoke, token); err != nil {
+	if spokeRun {
+		if gateway {
+			if err := m.ensureGatewaySandboxKubeconfig(ctx, run, step, cfg); err != nil {
+				createErr = err
+				return "", err
+			}
+		} else if err := m.ensureSandboxKubeconfig(ctx, run, step, spoke, token); err != nil {
 			createErr = err
 			return "", err
 		}
 	}
 	span.AddEvent("sandbox.sa.created")
 
-	if step == "execution" && agentCtx != nil && agentCtx.ApprovedOption != nil {
+	if step == "execution" && agentCtx != nil && agentCtx.ApprovedOption != nil && gateway {
+		// Gateway mode: execution acts as the requester, so it is bounded by
+		// the requester's own RBAC on the spoke. The approved option's RBAC is
+		// NOT materialized (there is no operator-managed identity to grant it
+		// to, and no management credential for the spoke).
+		if r := &agentCtx.ApprovedOption.RBAC; len(r.NamespaceScoped) > 0 || len(r.ClusterScoped) > 0 {
+			logf.FromContext(ctx).Info("gateway credential mode: approved execution RBAC is not materialized; execution runs with the requester's own permissions",
+				"targetCluster", run.Spec.TargetCluster)
+		}
+	} else if step == "execution" && agentCtx != nil && agentCtx.ApprovedOption != nil {
 		rbac := &agentCtx.ApprovedOption.RBAC
 		if len(rbac.NamespaceScoped) > 0 || len(rbac.ClusterScoped) > 0 {
 			// Execution RBAC targets spoke when targetCluster is set.
@@ -236,8 +276,11 @@ func (m *SandboxManager) Create(
 		return "", createErr
 	}
 
-	if spoke != nil {
+	if spokeRun {
 		mountSpokeKubeconfig(podSpec, sandboxKubeconfigSecretName(string(run.UID), step))
+		if gateway {
+			mountGatewayCredentials(podSpec, cfg.Sandbox.GatewayCASecret, runTokenSecretName(string(run.UID)))
+		}
 	}
 
 	if deadline > 0 {
@@ -288,8 +331,9 @@ func (m *SandboxManager) Create(
 		return name, err
 	}
 	// Skip SA owner ref for spoke SAs — cross-cluster owner refs don't work.
-	// Spoke SA cleanup is explicit via Release/finalizer path.
-	if spoke == nil {
+	// Spoke SA cleanup is explicit via Release/finalizer path. Gateway runs
+	// have no per-step SA at all.
+	if !spokeRun {
 		if err := m.setSAOwner(ctx, serviceAccount, ownerRef); err != nil {
 			return name, err
 		}
@@ -299,12 +343,14 @@ func (m *SandboxManager) Create(
 
 // ensureSA creates a per-step ServiceAccount and adds it to reader
 // ClusterRoleBindings. For spoke runs, creates the SA on the spoke cluster
-// with spoke labels, creates per-run CRBs, and requests a 24h bound token
-// via TokenRequest. For hub runs, adds the SA to the shared reader CRBs.
+// with spoke labels, creates per-run CRBs, and, when mintToken is true,
+// requests a 24h bound token via TokenRequest (skipped in gateway credential
+// mode, where the sandbox authenticates through the policy gateway with the
+// requester's token). For hub runs, adds the SA to the shared reader CRBs.
 // Idempotent.
 //
-// Returns the spoke token (non-empty for spoke, empty for hub).
-func (m *SandboxManager) ensureSA(ctx context.Context, run *agenticv1alpha1.AgenticRun, saName, step string, spoke *SpokeAccess) (string, error) {
+// Returns the spoke token (non-empty for spoke with mintToken, empty otherwise).
+func (m *SandboxManager) ensureSA(ctx context.Context, run *agenticv1alpha1.AgenticRun, saName, step string, spoke *SpokeAccess, mintToken bool) (string, error) {
 	if spoke != nil {
 		// spoke path: SA on spoke with spoke-specific labels
 		sa := &corev1.ServiceAccount{
@@ -330,6 +376,12 @@ func (m *SandboxManager) ensureSA(ctx context.Context, run *agenticv1alpha1.Agen
 		}
 		// Request a 24h bound token for the spoke SA. This token is embedded
 		// in the sandbox kubeconfig Secret so the pod can target the spoke.
+		// Skipped in gateway credential mode: the sandbox authenticates to the
+		// spoke through the hub-local Praxis policy gateway with the
+		// requester's token instead.
+		if !mintToken {
+			return "", nil
+		}
 		token, err := requestSpokeToken(ctx, spoke.Config, saName, spoke.Namespace)
 		if err != nil {
 			return "", err
@@ -371,6 +423,27 @@ func (m *SandboxManager) ensureSandboxKubeconfig(ctx context.Context, run *agent
 	if err != nil {
 		return err
 	}
+	return m.upsertSandboxKubeconfigSecret(ctx, run, step, kubeconfigData)
+}
+
+// ensureGatewaySandboxKubeconfig creates or refreshes the hub Secret holding
+// the gateway kubeconfig. Same Secret machinery as spoke-sa mode (name,
+// labels, owner refs); only the content differs — the server is the Praxis
+// gateway (URL template substituted with the run's targetCluster), the CA is
+// the gateway's serving CA mounted in the pod, and the bearer token is read
+// from the run-identity token file at request time, so no token is embedded.
+func (m *SandboxManager) ensureGatewaySandboxKubeconfig(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string, cfg *configuration.Config) error {
+	kubeconfigData, err := buildGatewaySandboxKubeconfig(cfg.Sandbox.GatewayServerURLTemplate, run.Spec.TargetCluster)
+	if err != nil {
+		return err
+	}
+	return m.upsertSandboxKubeconfigSecret(ctx, run, step, kubeconfigData)
+}
+
+// upsertSandboxKubeconfigSecret creates the per-step sandbox kubeconfig
+// Secret, or refreshes its data on retry (AlreadyExists) so the pod mounts
+// fresh content.
+func (m *SandboxManager) upsertSandboxKubeconfigSecret(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string, kubeconfigData []byte) error {
 	kcSecretName := sandboxKubeconfigSecretName(string(run.UID), step)
 	kcSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -473,8 +546,9 @@ func (m *SandboxManager) cleanupOnCreateFailure(ctx context.Context, run *agenti
 	}
 	// Spoke kubeconfig Secret cleanup (hub-side, alongside ConfigMap + result RBAC).
 	// Check LabelRun before deleting — a colliding name from a different run
-	// must not be removed (see ownership guard in Create).
-	if spoke != nil {
+	// must not be removed (see ownership guard in Create). Keyed on the run's
+	// target (not spoke != nil): gateway runs write a kubeconfig Secret too.
+	if isSpokeRun(run) {
 		kcName := sandboxKubeconfigSecretName(string(run.UID), step)
 		existing := &corev1.Secret{}
 		if err := m.client.Get(ctx, client.ObjectKey{Name: kcName, Namespace: m.namespace}, existing); err != nil {
@@ -552,6 +626,11 @@ func (m *SandboxManager) createBarePod(
 			}},
 		},
 		Spec: *podSpec,
+	}
+	// Trusted-target labels (gateway credential mode only): bind the sandbox
+	// pod to its run and target cluster for policy enforcement.
+	for k, v := range trustedTargetLabels(m.config.Get(), run) {
+		pod.Labels[k] = v
 	}
 
 	if _, err := m.requireRunnableRun(ctx, run); err != nil {
@@ -633,10 +712,19 @@ func (m *SandboxManager) createSandboxClaim(
 				"networkPolicyManagement": "Unmanaged",
 				"podTemplate": map[string]any{
 					"metadata": map[string]any{
-						"labels": map[string]any{
-							LabelRun:  string(run.UID),
-							LabelStep: step,
-						},
+						"labels": func() map[string]any {
+							labels := map[string]any{
+								LabelRun:  string(run.UID),
+								LabelStep: step,
+							}
+							// Trusted-target labels (gateway credential mode
+							// only): bind the sandbox pod to its run and
+							// target cluster for policy enforcement.
+							for k, v := range trustedTargetLabels(m.config.Get(), run) {
+								labels[k] = v
+							}
+							return labels
+						}(),
 						"annotations": map[string]any{
 							AnnotationRunName: run.Name,
 						},

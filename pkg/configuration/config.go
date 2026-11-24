@@ -16,6 +16,20 @@ import (
 type SandboxConfig struct {
 	Mode    string
 	PodSpec *corev1.PodSpec
+	// CredentialMode selects how sandbox pods authenticate to a spoke:
+	// "spoke-sa" (default, per-step spoke SA token embedded in the sandbox
+	// kubeconfig) or "gateway" (hub-local Praxis policy gateway performing an
+	// RFC 8693 token exchange per call; the requester's original token is
+	// mounted from a run-scoped Secret).
+	CredentialMode string
+	// GatewayServerURLTemplate is the gateway server URL template with a
+	// {targetCluster} placeholder, substituted per run. Required when
+	// CredentialMode is "gateway".
+	GatewayServerURLTemplate string
+	// GatewayCASecret is the name of the Secret in the operator namespace
+	// holding the gateway serving CA under key "ca.crt". Required when
+	// CredentialMode is "gateway".
+	GatewayCASecret string
 }
 
 // OTELConfig holds OTEL collector connectivity from the ConfigMap.
@@ -157,7 +171,10 @@ func parseConfigMap(cm *corev1.ConfigMap) (*Config, error) {
 	cfg := &Config{
 		TerminalTTLDays: parseTerminalTTLDays(cm.Data),
 		Sandbox: SandboxConfig{
-			Mode: cm.Data[KeySandboxMode],
+			Mode:                     cm.Data[KeySandboxMode],
+			CredentialMode:           cm.Data[KeySandboxCredentialMode],
+			GatewayServerURLTemplate: cm.Data[KeyGatewayServerURLTemplate],
+			GatewayCASecret:          cm.Data[KeyGatewayCASecret],
 		},
 		TLS: TLSConfig{
 			Profile:      cm.Data[KeyTLSProfile],
@@ -194,5 +211,34 @@ func parseConfigMap(cm *corev1.ConfigMap) (*Config, error) {
 		cfg.Sandbox.Mode = "bare-pod"
 	}
 
+	if cfg.Sandbox.CredentialMode == "" {
+		cfg.Sandbox.CredentialMode = CredentialModeSpokeSA
+	}
+	if err := validateCredentialMode(cfg.Sandbox); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// validateCredentialMode checks the sandbox credential mode and its
+// gateway-specific required configuration. Fails loudly on unknown modes and
+// on gateway mode without a server URL template or CA Secret so
+// misconfiguration surfaces at ConfigMap load time, not at pod creation.
+func validateCredentialMode(sandbox SandboxConfig) error {
+	switch sandbox.CredentialMode {
+	case CredentialModeSpokeSA:
+		return nil
+	case CredentialModeGateway:
+		if sandbox.GatewayServerURLTemplate == "" {
+			return fmt.Errorf("%s: %s is required", ErrMissingGatewayConfig, KeyGatewayServerURLTemplate)
+		}
+		if sandbox.GatewayCASecret == "" {
+			return fmt.Errorf("%s: %s is required", ErrMissingGatewayConfig, KeyGatewayCASecret)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s: %q (want %q or %q)", ErrInvalidCredentialMode,
+			sandbox.CredentialMode, CredentialModeSpokeSA, CredentialModeGateway)
+	}
 }

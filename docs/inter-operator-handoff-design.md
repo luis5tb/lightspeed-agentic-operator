@@ -20,6 +20,9 @@ The classic operator (lightspeed-operator) produces a `lightspeed-agentic-config
 |-----|------|-------------|
 | `sandbox-mode` | string | `bare-pod` or `sandbox-claim` |
 | `sandbox-pod-spec` | JSON string | Serialized `corev1.PodSpec` — image, resources, tolerations, nodeSelector, emptyDir volumes |
+| `sandbox-credential-mode` | string | `spoke-sa` (default) or `gateway` — how sandbox pods authenticate to a spoke cluster. `gateway` requires `gateway-server-url-template` and `gateway-ca-secret` (config load fails loudly when either is missing) |
+| `gateway-server-url-template` | string | Praxis policy gateway server URL with a `{targetCluster}` placeholder, e.g. `https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443`. Required when `sandbox-credential-mode=gateway` |
+| `gateway-ca-secret` | string | Name of the Secret (operator namespace, key `ca.crt`) holding the gateway's serving CA. Required when `sandbox-credential-mode=gateway` |
 | `otel-collector-endpoint` | string | OTLP gRPC endpoint (`host:port`) |
 | `otel-admin-endpoint` | string | HTTPS admin API base URL |
 | `otel-ca-secret` | string | Name of the Secret holding OTEL client CA cert |

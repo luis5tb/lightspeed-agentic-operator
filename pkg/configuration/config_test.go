@@ -437,3 +437,87 @@ func TestCollectorConfig_Equal(t *testing.T) {
 		t.Error("non-nil should not equal nil")
 	}
 }
+
+func TestParseConfigMap_CredentialModeDefaultsToSpokeSA(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "test-ns"},
+		Data:       map[string]string{},
+	}
+	cfg, err := parseConfigMap(cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Sandbox.CredentialMode != CredentialModeSpokeSA {
+		t.Errorf("CredentialMode = %q, want %q", cfg.Sandbox.CredentialMode, CredentialModeSpokeSA)
+	}
+	if cfg.Sandbox.GatewayServerURLTemplate != "" || cfg.Sandbox.GatewayCASecret != "" {
+		t.Errorf("gateway config should be empty, got template %q CA secret %q",
+			cfg.Sandbox.GatewayServerURLTemplate, cfg.Sandbox.GatewayCASecret)
+	}
+}
+
+func TestParseConfigMap_CredentialModeGateway(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "test-ns"},
+		Data: map[string]string{
+			KeySandboxCredentialMode:    CredentialModeGateway,
+			KeyGatewayServerURLTemplate: "https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443",
+			KeyGatewayCASecret:          "praxis-serving-ca",
+		},
+	}
+	cfg, err := parseConfigMap(cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Sandbox.CredentialMode != CredentialModeGateway {
+		t.Errorf("CredentialMode = %q, want %q", cfg.Sandbox.CredentialMode, CredentialModeGateway)
+	}
+	if cfg.Sandbox.GatewayCASecret != "praxis-serving-ca" {
+		t.Errorf("GatewayCASecret = %q", cfg.Sandbox.GatewayCASecret)
+	}
+}
+
+func TestParseConfigMap_CredentialModeGatewayMissingConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]string
+	}{
+		{
+			name: "missing template",
+			data: map[string]string{
+				KeySandboxCredentialMode: CredentialModeGateway,
+				KeyGatewayCASecret:       "praxis-serving-ca",
+			},
+		},
+		{
+			name: "missing CA secret",
+			data: map[string]string{
+				KeySandboxCredentialMode:    CredentialModeGateway,
+				KeyGatewayServerURLTemplate: "https://praxis-{targetCluster}.svc:8443",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "test-ns"},
+				Data:       tt.data,
+			}
+			if _, err := parseConfigMap(cm); err == nil {
+				t.Fatal("expected error for gateway mode without required configuration")
+			}
+		})
+	}
+}
+
+func TestParseConfigMap_CredentialModeUnknown(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "test-ns"},
+		Data: map[string]string{
+			KeySandboxCredentialMode: "telepathy",
+		},
+	}
+	if _, err := parseConfigMap(cm); err == nil {
+		t.Fatal("expected error for unknown sandbox-credential-mode")
+	}
+}

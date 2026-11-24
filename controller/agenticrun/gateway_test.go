@@ -464,6 +464,347 @@ func TestCreate_GatewaySpokeRun_MissingRunToken(t *testing.T) {
 	}
 }
 
+// --- credential pause / resume ---
+
+func newCredentialPauseReconciler(t *testing.T, run *agenticv1alpha1.AgenticRun, objs ...client.Object) (*AgenticRunReconciler, client.Client) {
+	t.Helper()
+	builder := fake.NewClientBuilder().WithScheme(testScheme()).
+		WithStatusSubresource(&agenticv1alpha1.AgenticRun{}).
+		WithObjects(run)
+	if len(objs) > 0 {
+		builder = builder.WithObjects(objs...)
+	}
+	fc := builder.Build()
+	return &AgenticRunReconciler{Client: fc, Namespace: "test-ns"}, fc
+}
+
+func TestPauseForCredentials_SetsCondition(t *testing.T) {
+	run := testSpokeRun()
+	r, fc := newCredentialPauseReconciler(t, run)
+
+	waitErr := &credentialWaitError{
+		secretName: runTokenSecretName(string(run.UID)),
+		secretRV:   "42",
+		reason:     "Secret not found",
+	}
+	result, err := r.pauseForCredentials(context.Background(), run, waitErr)
+	if err != nil {
+		t.Fatalf("pauseForCredentials failed: %v", err)
+	}
+	if result.RequeueAfter != credentialPauseRequeueAfter {
+		t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, credentialPauseRequeueAfter)
+	}
+
+	stored := &agenticv1alpha1.AgenticRun{}
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	cond := findCondition(stored, agenticv1alpha1.AgenticRunConditionCredentialsExpired)
+	if cond == nil {
+		t.Fatal("CredentialsExpired condition not set")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("condition status = %q", cond.Status)
+	}
+	if cond.Reason != agenticv1alpha1.ReasonCredentialsExpired {
+		t.Errorf("condition reason = %q, want %q", cond.Reason, agenticv1alpha1.ReasonCredentialsExpired)
+	}
+	if observedRVFromMessage(cond.Message) != "42" {
+		t.Errorf("message should embed observed resourceVersion 42, got %q", cond.Message)
+	}
+	if strings.Contains(cond.Message, "token-a-value") {
+		t.Error("condition message must never contain the token value")
+	}
+}
+
+func TestResumeFromCredentialPause(t *testing.T) {
+	run := testSpokeRun()
+
+	tests := []struct {
+		name        string
+		secretRV    string // run-token Secret resourceVersion; "" = absent
+		pausedRV    string // resourceVersion embedded in the pause condition
+		wantResumed bool
+	}{
+		{name: "secret still missing", secretRV: "", pausedRV: "", wantResumed: false},
+		{name: "secret unchanged", secretRV: "42", pausedRV: "42", wantResumed: false},
+		{name: "secret renewed", secretRV: "43", pausedRV: "42", wantResumed: true},
+		{name: "no recorded RV resumes on valid secret", secretRV: "43", pausedRV: "", wantResumed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var objs []client.Object
+			if tt.secretRV != "" {
+				objs = append(objs, testRunTokenSecret(run, tt.secretRV))
+			}
+			paused := run.DeepCopy()
+			stampCredentialsExpired(t, paused, tt.pausedRV)
+			r, fc := newCredentialPauseReconciler(t, paused, objs...)
+
+			resumed, err := r.resumeFromCredentialPause(context.Background(), paused)
+			if err != nil {
+				t.Fatalf("resumeFromCredentialPause failed: %v", err)
+			}
+			if resumed != tt.wantResumed {
+				t.Fatalf("resumed = %v, want %v", resumed, tt.wantResumed)
+			}
+
+			stored := &agenticv1alpha1.AgenticRun{}
+			if err := fc.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			cond := findCondition(stored, agenticv1alpha1.AgenticRunConditionCredentialsExpired)
+			if tt.wantResumed && cond != nil {
+				t.Error("condition should be cleared after resume")
+			}
+			if !tt.wantResumed && cond == nil {
+				t.Error("condition should remain while paused")
+			}
+		})
+	}
+}
+
+func TestCredentialPauseMessage_RoundTrip(t *testing.T) {
+	waitErr := &credentialWaitError{secretName: "ls-run-token-x", secretRV: "77", reason: "missing key"}
+	msg := credentialPauseMessage(waitErr)
+	if got := observedRVFromMessage(msg); got != "77" {
+		t.Errorf("observedRVFromMessage = %q, want 77 (message %q)", got, msg)
+	}
+	if got := observedRVFromMessage("externally written message"); got != "" {
+		t.Errorf("unparseable message should yield %q, got %q", "", got)
+	}
+}
+
+// TestResumeFromCredentialPause_ModeFlipToSpokeSA verifies that a run paused
+// in gateway credential mode resumes unconditionally when the configuration
+// flips back to spoke-sa mid-pause. Without this, the run would requeue
+// forever waiting for a run-token Secret it no longer needs, with no sandbox
+// pod for the timeout handler to observe.
+func TestResumeFromCredentialPause_ModeFlipToSpokeSA(t *testing.T) {
+	run := testSpokeRun()
+
+	tests := []struct {
+		name        string
+		config      *configuration.Cache
+		wantResumed bool
+	}{
+		{
+			name:        "still gateway mode keeps waiting without secret",
+			config:      testGatewayCache(t),
+			wantResumed: false,
+		},
+		{
+			name:        "mode flipped to spoke-sa resumes without secret",
+			config:      testCache(t, "bare-pod"),
+			wantResumed: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			paused := run.DeepCopy()
+			stampCredentialsExpired(t, paused, "42")
+			r, fc := newCredentialPauseReconciler(t, paused)
+			r.Config = tt.config
+
+			resumed, err := r.resumeFromCredentialPause(context.Background(), paused)
+			if err != nil {
+				t.Fatalf("resumeFromCredentialPause failed: %v", err)
+			}
+			if resumed != tt.wantResumed {
+				t.Fatalf("resumed = %v, want %v", resumed, tt.wantResumed)
+			}
+
+			stored := &agenticv1alpha1.AgenticRun{}
+			if err := fc.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			cond := findCondition(stored, agenticv1alpha1.AgenticRunConditionCredentialsExpired)
+			if tt.wantResumed && cond != nil {
+				t.Error("condition should be cleared after mode-flip resume")
+			}
+			if !tt.wantResumed && cond == nil {
+				t.Error("condition should remain while still gateway-paused")
+			}
+		})
+	}
+}
+
+// --- handler-level pause → resume → relaunch ---
+
+// countingAgentCaller wraps an AgentCaller and counts Analyze invocations,
+// distinguishing successful relaunches from attempts that paused waiting for
+// credentials (the pause happens inside Sandbox.Create, after Analyze was
+// entered).
+type countingAgentCaller struct {
+	AgentCaller
+	analyzeCalls       int
+	analyzeCompletions int
+}
+
+func (c *countingAgentCaller) Analyze(ctx context.Context, run *agenticv1alpha1.AgenticRun, step resolvedStep) error {
+	c.analyzeCalls++
+	err := c.AgentCaller.Analyze(ctx, run, step)
+	if err == nil {
+		c.analyzeCompletions++
+	}
+	return err
+}
+
+// TestHandleAnalysis_CredentialPauseResumeRelaunch exercises the handler-level
+// pause → resume → relaunch path in gateway credential mode: a missing
+// run-token Secret pauses analysis (Analyzed=Unknown, CredentialsExpired=True,
+// no pod); the adapter then writes a renewed, valid-labeled run-token Secret;
+// the next handler pass resumes and relaunches the agent exactly once; and a
+// further pass must not double-create the sandbox pod.
+func TestHandleAnalysis_CredentialPauseResumeRelaunch(t *testing.T) {
+	origClient := NewClientFromConfig
+	origClientset := NewClientsetFromConfig
+
+	srcBindings := spokeReaderBindings()
+	spokeFC := fake.NewClientBuilder().WithScheme(testScheme()).
+		WithObjects(srcBindings[0], srcBindings[1]).Build()
+	NewClientFromConfig = func(cfg *rest.Config) (client.Client, error) {
+		return spokeFC, nil
+	}
+	// The spoke TokenRequest API must never be called in gateway mode.
+	NewClientsetFromConfig = func(cfg *rest.Config) (kubernetes.Interface, error) {
+		t.Error("requestSpokeToken must not be called in gateway credential mode")
+		return nil, fmt.Errorf("unexpected TokenRequest in gateway mode")
+	}
+	t.Cleanup(func() {
+		NewClientFromConfig = origClient
+		NewClientsetFromConfig = origClientset
+	})
+
+	cache := testGatewayCache(t)
+	run := testSpokeRun()
+	hubFC := fake.NewClientBuilder().WithScheme(testScheme()).
+		WithStatusSubresource(&agenticv1alpha1.AgenticRun{}).
+		WithObjects(run, testReaderCRB(), testSpokeKubeconfigSecret()).
+		Build()
+	mgr := newTestSandboxManager(hubFC, cache)
+	agent := &countingAgentCaller{AgentCaller: &SandboxAgentCaller{
+		Sandbox:   mgr,
+		K8sClient: hubFC,
+		APIReader: hubFC,
+		Namespace: "test-ns",
+	}}
+	r := &AgenticRunReconciler{
+		Client:    hubFC,
+		APIReader: hubFC,
+		Agent:     agent,
+		Config:    cache,
+		Namespace: "test-ns",
+	}
+	resolved := &resolvedWorkflow{Analysis: resolvedStep{
+		Agent: testSMAgent(),
+		LLM:   testLLMForManager(),
+	}}
+	policy := testAutoApprovePolicy()
+
+	countPods := func() int {
+		t.Helper()
+		var pods corev1.PodList
+		if err := hubFC.List(context.Background(), &pods); err != nil {
+			t.Fatalf("list pods: %v", err)
+		}
+		return len(pods.Items)
+	}
+	currentRun := func() *agenticv1alpha1.AgenticRun {
+		t.Helper()
+		stored := &agenticv1alpha1.AgenticRun{}
+		if err := hubFC.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		return stored
+	}
+
+	// Pass 1: no run-token Secret yet — the step pauses before any pod or
+	// spoke resource is created.
+	result, err := r.handleAnalysis(context.Background(), currentRun(), resolved, nil, policy)
+	if err != nil {
+		t.Fatalf("pass 1 handleAnalysis: %v", err)
+	}
+	if result.RequeueAfter != credentialPauseRequeueAfter {
+		t.Fatalf("pass 1 RequeueAfter = %v, want %v", result.RequeueAfter, credentialPauseRequeueAfter)
+	}
+	if agent.analyzeCalls != 1 || agent.analyzeCompletions != 0 {
+		t.Fatalf("agent Analyze calls during pause = %d (completed %d), want 1 entered / 0 completed (paused before pod creation)", agent.analyzeCalls, agent.analyzeCompletions)
+	}
+	if got := countPods(); got != 0 {
+		t.Fatalf("pods during pause = %d, want 0", got)
+	}
+	if !credentialPauseActive(currentRun()) {
+		t.Fatal("run should carry an active CredentialsExpired condition while paused")
+	}
+
+	// The adapter renews the credential: a new, valid-labeled run-token
+	// Secret (the fake client assigns it resourceVersion "1" on create,
+	// which differs from the RV observed at pause time for the missing
+	// Secret, exercising the resourceVersion-changed resume path).
+	renewed := testRunTokenSecret(run, "43")
+	renewed.ResourceVersion = ""
+	if err := hubFC.Create(context.Background(), renewed); err != nil {
+		t.Fatalf("create renewed run-token Secret: %v", err)
+	}
+
+	// Pass 2: renewed Secret — the pause clears and the agent relaunches
+	// exactly once, creating the sandbox pod exactly once.
+	result, err = r.handleAnalysis(context.Background(), currentRun(), resolved, nil, policy)
+	if err != nil {
+		t.Fatalf("pass 2 handleAnalysis: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("pass 2 should proceed without requeue, got %+v", result)
+	}
+	if agent.analyzeCalls != 2 || agent.analyzeCompletions != 1 {
+		t.Fatalf("agent Analyze calls after resume = %d (completed %d), want 2 entered / 1 completed relaunch", agent.analyzeCalls, agent.analyzeCompletions)
+	}
+	if got := countPods(); got != 1 {
+		t.Fatalf("pods after resume = %d, want 1", got)
+	}
+	resumed := currentRun()
+	if credentialPauseActive(resumed) {
+		t.Fatal("CredentialsExpired condition should be cleared after resume")
+	}
+	if resumed.Status.Steps.Analysis.Sandbox.ClaimName == "" {
+		t.Fatal("analysis sandbox info should be recorded after relaunch")
+	}
+
+	// Pass 3: Analyzed=Unknown with no active pause — the in-progress guard
+	// must hold: no second agent call, no double pod creation.
+	if _, err := r.handleAnalysis(context.Background(), currentRun(), resolved, nil, policy); err != nil {
+		t.Fatalf("pass 3 handleAnalysis: %v", err)
+	}
+	if agent.analyzeCalls != 2 || agent.analyzeCompletions != 1 {
+		t.Fatalf("agent Analyze calls after third pass = %d (completed %d), want 2 entered / 1 completed (no double-create)", agent.analyzeCalls, agent.analyzeCompletions)
+	}
+	if got := countPods(); got != 1 {
+		t.Fatalf("pods after third pass = %d, want 1 (no double-create)", got)
+	}
+}
+
+func findCondition(run *agenticv1alpha1.AgenticRun, condType string) *metav1.Condition {
+	for i := range run.Status.Conditions {
+		if run.Status.Conditions[i].Type == condType {
+			return &run.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// stampCredentialsExpired stamps a CredentialsExpired=True condition with
+// the given observed resourceVersion embedded in the message.
+func stampCredentialsExpired(t *testing.T, run *agenticv1alpha1.AgenticRun, rv string) {
+	t.Helper()
+	run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{
+		Type:    agenticv1alpha1.AgenticRunConditionCredentialsExpired,
+		Status:  metav1.ConditionTrue,
+		Reason:  agenticv1alpha1.ReasonCredentialsExpired,
+		Message: fmt.Sprintf("run credential Secret not ready (observed resourceVersion %q)", rv),
+	})
+}
+
 // Releasing a gateway-mode spoke run must not need the
 // spoke-kubeconfig-{targetCluster} Secret (the run created nothing on the
 // spoke), while spoke-sa mode still reports the missing management

@@ -58,8 +58,19 @@ func (r *AgenticRunReconciler) handleAnalysis(
 	analyzed := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionAnalyzed)
 	if analyzed != nil {
 		if analyzed.Status == metav1.ConditionUnknown {
-			log.V(1).Info("analysis already in progress, waiting")
-			return ctrl.Result{}, nil
+			if credentialPauseActive(run) {
+				resumed, err := r.resumeFromCredentialPause(ctx, run)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if !resumed {
+					return ctrl.Result{RequeueAfter: credentialPauseRequeueAfter}, nil
+				}
+				log.Info("run credential renewed, relaunching analysis")
+			} else {
+				log.V(1).Info("analysis already in progress, waiting")
+				return ctrl.Result{}, nil
+			}
 		}
 		if analyzed.Status == metav1.ConditionTrue {
 			log.V(1).Info("analysis already completed")
@@ -83,6 +94,9 @@ func (r *AgenticRunReconciler) handleAnalysis(
 		if isStopAcceptedError(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
+		if credWait := credentialWaitFromError(err); credWait != nil {
+			return r.pauseForCredentials(ctx, run, credWait)
+		}
 		return r.failStep(ctx, run, agenticv1alpha1.AgenticRunConditionAnalyzed, err)
 	}
 
@@ -103,8 +117,19 @@ func (r *AgenticRunReconciler) handleRevision(
 
 	analyzed := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionAnalyzed)
 	if analyzed != nil && analyzed.Status == metav1.ConditionUnknown {
-		log.V(1).Info("revision already in progress, waiting")
-		return ctrl.Result{}, nil
+		if credentialPauseActive(run) {
+			resumed, err := r.resumeFromCredentialPause(ctx, run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !resumed {
+				return ctrl.Result{RequeueAfter: credentialPauseRequeueAfter}, nil
+			}
+			log.Info("run credential renewed, relaunching revision")
+		} else {
+			log.V(1).Info("revision already in progress, waiting")
+			return ctrl.Result{}, nil
+		}
 	}
 
 	if run.Labels[terminalTTLLabel] != "" {
@@ -137,6 +162,9 @@ func (r *AgenticRunReconciler) handleRevision(
 	if err := r.Agent.Analyze(ctx, run, resolved.Analysis); err != nil {
 		if isStopAcceptedError(err) {
 			return ctrl.Result{Requeue: true}, nil
+		}
+		if credWait := credentialWaitFromError(err); credWait != nil {
+			return r.pauseForCredentials(ctx, run, credWait)
 		}
 		return r.failStep(ctx, run, agenticv1alpha1.AgenticRunConditionAnalyzed, err)
 	}
@@ -196,8 +224,19 @@ func (r *AgenticRunReconciler) handleExecution(
 	executed := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionExecuted)
 	if executed != nil {
 		if executed.Status == metav1.ConditionUnknown {
-			log.V(1).Info("execution already in progress, waiting")
-			return ctrl.Result{}, nil
+			if credentialPauseActive(run) {
+				resumed, err := r.resumeFromCredentialPause(ctx, run)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if !resumed {
+					return ctrl.Result{RequeueAfter: credentialPauseRequeueAfter}, nil
+				}
+				log.Info("run credential renewed, relaunching execution")
+			} else {
+				log.V(1).Info("execution already in progress, waiting")
+				return ctrl.Result{}, nil
+			}
 		}
 		if executed.Status == metav1.ConditionTrue {
 			log.V(1).Info("execution already completed")
@@ -234,6 +273,9 @@ func (r *AgenticRunReconciler) handleExecution(
 	if err := r.Agent.Execute(ctx, run, *resolved.Execution, selectedOption); err != nil {
 		if isStopAcceptedError(err) {
 			return ctrl.Result{Requeue: true}, nil
+		}
+		if credWait := credentialWaitFromError(err); credWait != nil {
+			return r.pauseForCredentials(ctx, run, credWait)
 		}
 		return r.failStep(ctx, run, agenticv1alpha1.AgenticRunConditionExecuted, err)
 	}
@@ -277,8 +319,19 @@ func (r *AgenticRunReconciler) handleVerification(
 
 	verified := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionVerified)
 	if verified != nil && verified.Status == metav1.ConditionUnknown {
-		log.V(1).Info("verification already in progress, waiting")
-		return ctrl.Result{}, nil
+		if credentialPauseActive(run) {
+			resumed, err := r.resumeFromCredentialPause(ctx, run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !resumed {
+				return ctrl.Result{RequeueAfter: credentialPauseRequeueAfter}, nil
+			}
+			log.Info("run credential renewed, relaunching verification")
+		} else {
+			log.V(1).Info("verification already in progress, waiting")
+			return ctrl.Result{}, nil
+		}
 	}
 
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
@@ -314,6 +367,9 @@ func (r *AgenticRunReconciler) handleVerification(
 		if isStopAcceptedError(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
+		if credWait := credentialWaitFromError(err); credWait != nil {
+			return r.pauseForCredentials(ctx, run, credWait)
+		}
 		return r.failStep(ctx, run, agenticv1alpha1.AgenticRunConditionVerified, err)
 	}
 
@@ -335,9 +391,14 @@ func (r *AgenticRunReconciler) handleFailed(
 		return ctrl.Result{}, nil
 	}
 
-	spoke, spokeErr := spokeAccessForRun(ctx, r.Client, run, r.Namespace)
+	spoke, spokeErr := spokeManagementAccess(ctx, r.Client, run, r.Namespace, configFrom(r.Config))
 	if spokeErr != nil {
 		log.Error(spokeErr, "RBAC cleanup: spoke unreachable")
+	}
+	// Gateway-mode spoke runs created nothing on the spoke, and the loop below
+	// would treat a nil spoke as a hub run: nothing to clean.
+	if isSpokeRun(run) && spoke == nil && spokeErr == nil {
+		return ctrl.Result{}, nil
 	}
 
 	// Clean SAs, reader CRBs, and execution RBAC for all steps.
@@ -792,10 +853,20 @@ func (r *AgenticRunReconciler) handleEscalation(
 
 	escalated := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionEscalated)
 	if escalated != nil {
-		if escalated.Status == metav1.ConditionUnknown &&
-			(escalated.Reason == reasonInProgress || escalated.Reason == ReasonRunning || escalated.Reason == ReasonWaitingForSandbox) {
-			log.V(1).Info("escalation already in progress, waiting")
-			return ctrl.Result{}, nil
+		if escalated.Status == metav1.ConditionUnknown {
+			if credentialPauseActive(run) {
+				resumed, err := r.resumeFromCredentialPause(ctx, run)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if !resumed {
+					return ctrl.Result{RequeueAfter: credentialPauseRequeueAfter}, nil
+				}
+				log.Info("run credential renewed, relaunching escalation")
+			} else if escalated.Reason == reasonInProgress || escalated.Reason == ReasonRunning || escalated.Reason == ReasonWaitingForSandbox {
+				log.V(1).Info("escalation already in progress, waiting")
+				return ctrl.Result{}, nil
+			}
 		}
 		if escalated.Status == metav1.ConditionTrue {
 			log.V(1).Info("escalation already completed")
@@ -840,6 +911,9 @@ func (r *AgenticRunReconciler) handleEscalation(
 	if err := r.Agent.Escalate(ctx, run, step); err != nil {
 		if isStopAcceptedError(err) {
 			return ctrl.Result{Requeue: true}, nil
+		}
+		if credWait := credentialWaitFromError(err); credWait != nil {
+			return r.pauseForCredentials(ctx, run, credWait)
 		}
 		return r.failStep(ctx, run, agenticv1alpha1.AgenticRunConditionEscalated, err)
 	}

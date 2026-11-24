@@ -8,6 +8,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -47,6 +49,11 @@ const (
 	// when the adapter renews it; clients must reload it.
 	runIdentityMountPath = "/var/run/secrets/run-identity"
 	runIdentityVolume    = "run-identity"
+
+	// observedRVFormat embeds the run-token Secret's resourceVersion in the
+	// CredentialsExpired condition message so the controller can detect
+	// renewal (a changed resourceVersion) and re-attempt the paused step.
+	observedRVFormat = "(observed resourceVersion %q)"
 
 	ErrGetRunTokenSecret = "get run-token Secret"
 )
@@ -227,4 +234,33 @@ func trustedTargetLabels(cfg *configuration.Config, run *agenticv1alpha1.Agentic
 		LabelSpokeCluster: truncateLabelValue(run.Spec.TargetCluster),
 		LabelAgenticRun:   string(run.UID),
 	}
+}
+
+// credentialPauseMessage renders a CredentialsExpired condition message that
+// embeds the observed run-token Secret resourceVersion for renewal detection.
+func credentialPauseMessage(err *credentialWaitError) string {
+	return fmt.Sprintf("%s "+observedRVFormat, err.Error(), err.secretRV)
+}
+
+// observedRVFromMessage extracts the resourceVersion embedded by
+// credentialPauseMessage. Returns "" when absent (e.g. a condition written by
+// another component), in which case any valid run-token Secret resumes.
+func observedRVFromMessage(message string) string {
+	idx := strings.LastIndex(message, "(observed resourceVersion \"")
+	if idx < 0 {
+		return ""
+	}
+	rest := message[idx+len("(observed resourceVersion \""):]
+	end := strings.Index(rest, "\"")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// credentialPauseActive reports whether the run is paused waiting for a
+// renewed run credential.
+func credentialPauseActive(run *agenticv1alpha1.AgenticRun) bool {
+	cond := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionCredentialsExpired)
+	return cond != nil && cond.Status == metav1.ConditionTrue
 }

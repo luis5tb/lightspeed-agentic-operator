@@ -143,7 +143,7 @@ func (m *SandboxManager) Create(
 	// renewed Secret pauses the run via the CredentialsExpired condition
 	// instead of failing the step — the external A2A adapter rewrites it.
 	if gateway {
-		if _, err := validateRunTokenSecret(ctx, m.client, m.namespace, run); err != nil {
+		if _, err := validateRunTokenSecret(ctx, m.client, m.namespace, run, step, cfg); err != nil {
 			return "", err
 		}
 	}
@@ -279,7 +279,8 @@ func (m *SandboxManager) Create(
 	if spokeRun {
 		mountSpokeKubeconfig(podSpec, sandboxKubeconfigSecretName(string(run.UID), step))
 		if gateway {
-			mountGatewayCredentials(podSpec, cfg.Sandbox.GatewayCASecret, runTokenSecretName(string(run.UID)))
+			_, tokenKey := gatewayCredentialForStep(step, cfg)
+			mountGatewayCredentials(podSpec, cfg.Sandbox.GatewayCASecret, runTokenSecretName(string(run.UID)), tokenKey)
 		}
 	}
 
@@ -433,7 +434,8 @@ func (m *SandboxManager) ensureSandboxKubeconfig(ctx context.Context, run *agent
 // the gateway's serving CA mounted in the pod, and the bearer token is read
 // from the run-identity token file at request time, so no token is embedded.
 func (m *SandboxManager) ensureGatewaySandboxKubeconfig(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string, cfg *configuration.Config) error {
-	kubeconfigData, err := buildGatewaySandboxKubeconfig(cfg.Sandbox.GatewayServerURLTemplate, run.Spec.TargetCluster)
+	serverURLTemplate, tokenKey := gatewayCredentialForStep(step, cfg)
+	kubeconfigData, err := buildGatewaySandboxKubeconfig(serverURLTemplate, run.Spec.TargetCluster, tokenKey)
 	if err != nil {
 		return err
 	}

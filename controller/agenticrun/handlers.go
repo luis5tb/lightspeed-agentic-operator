@@ -59,7 +59,7 @@ func (r *AgenticRunReconciler) handleAnalysis(
 	if analyzed != nil {
 		if analyzed.Status == metav1.ConditionUnknown {
 			if credentialPauseActive(run) {
-				resumed, err := r.resumeFromCredentialPause(ctx, run)
+				resumed, err := r.resumeFromCredentialPause(ctx, run, string(agenticv1alpha1.SandboxStepAnalysis))
 				if err != nil {
 					return ctrl.Result{}, err
 				}
@@ -118,7 +118,7 @@ func (r *AgenticRunReconciler) handleRevision(
 	analyzed := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionAnalyzed)
 	if analyzed != nil && analyzed.Status == metav1.ConditionUnknown {
 		if credentialPauseActive(run) {
-			resumed, err := r.resumeFromCredentialPause(ctx, run)
+			resumed, err := r.resumeFromCredentialPause(ctx, run, string(agenticv1alpha1.SandboxStepAnalysis))
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -225,7 +225,7 @@ func (r *AgenticRunReconciler) handleExecution(
 	if executed != nil {
 		if executed.Status == metav1.ConditionUnknown {
 			if credentialPauseActive(run) {
-				resumed, err := r.resumeFromCredentialPause(ctx, run)
+				resumed, err := r.resumeFromCredentialPause(ctx, run, string(agenticv1alpha1.SandboxStepExecution))
 				if err != nil {
 					return ctrl.Result{}, err
 				}
@@ -320,13 +320,18 @@ func (r *AgenticRunReconciler) handleVerification(
 	verified := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionVerified)
 	if verified != nil && verified.Status == metav1.ConditionUnknown {
 		if credentialPauseActive(run) {
-			resumed, err := r.resumeFromCredentialPause(ctx, run)
+			resumed, err := r.resumeFromCredentialPause(ctx, run, string(agenticv1alpha1.SandboxStepVerification))
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 			if !resumed {
 				return ctrl.Result{RequeueAfter: credentialPauseRequeueAfter}, nil
 			}
+			// resumeFromCredentialPause patches the run while clearing the
+			// pause condition. Use that refreshed object as the optimistic-lock
+			// base for the verification-in-progress patch below; the base
+			// captured at handler entry has a stale resourceVersion.
+			base = run.DeepCopy()
 			log.Info("run credential renewed, relaunching verification")
 		} else {
 			log.V(1).Info("verification already in progress, waiting")
@@ -855,7 +860,7 @@ func (r *AgenticRunReconciler) handleEscalation(
 	if escalated != nil {
 		if escalated.Status == metav1.ConditionUnknown {
 			if credentialPauseActive(run) {
-				resumed, err := r.resumeFromCredentialPause(ctx, run)
+				resumed, err := r.resumeFromCredentialPause(ctx, run, string(agenticv1alpha1.SandboxStepEscalation))
 				if err != nil {
 					return ctrl.Result{}, err
 				}

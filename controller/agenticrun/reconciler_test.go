@@ -210,6 +210,7 @@ type testAgentCaller struct {
 	analyzeErr    error
 	executeErr    error
 	verifyErr     error
+	verifyCalls   int
 	escalateErr   error
 	escalateCalls int
 
@@ -301,6 +302,7 @@ func (ta *testAgentCaller) Execute(ctx context.Context, run *agenticv1alpha1.Age
 }
 
 func (ta *testAgentCaller) Verify(ctx context.Context, run *agenticv1alpha1.AgenticRun, _ resolvedStep, _ *agenticv1alpha1.RemediationOption, _ *ExecutionOutput) error {
+	ta.verifyCalls++
 	if ta.verifyErr != nil {
 		return ta.verifyErr
 	}

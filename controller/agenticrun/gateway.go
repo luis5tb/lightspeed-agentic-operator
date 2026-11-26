@@ -2,6 +2,8 @@ package agenticrun
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	stderrors "errors"
 	"fmt"
 	"strings"
@@ -24,27 +26,32 @@ import (
 // In this mode the sandbox pod does not hold a spoke SA token. Its kubeconfig
 // points at a hub-local Praxis policy gateway that performs an RFC 8693 token
 // exchange per call: the server is the gateway, the CA is the gateway's
-// serving CA, and the bearer token is the requester's original token (Token A)
-// mounted from a run-scoped Secret written by an external A2A adapter.
+// serving CA, and the bearer token is the requester's original token mounted
+// from a run-scoped Secret written by an external A2A adapter. Each step sees
+// only its configured token key; execution uses a separate gateway and token
+// when that endpoint is configured.
 // The operator does NO spoke management in this mode (no standing
 // spoke-kubeconfig, no per-step spoke SA, no reader ClusterRoleBindings): the
 // sandbox acts as the requester, so the spoke's own RBAC for that identity
 // applies. See spokeManagementAccess.
 
 const (
-	// runTokenSecretPrefix is the name prefix for run-scoped Secrets holding
-	// the requester's original token (Token A).
+	// runTokenSecretPrefix is the name prefix for run-scoped gateway credential
+	// Secrets.
 	runTokenSecretPrefix = "ls-run-token-"
 
-	// runTokenKey is the data key holding Token A in the run-token Secret.
+	// runTokenKey is the data key holding the read-only gateway credential.
 	runTokenKey = "token-a"
+	// runExecutionTokenKey is projected only into execution sandboxes when a
+	// separate execution gateway is configured.
+	runExecutionTokenKey = "token-execution"
 
 	// Mount path for the gateway serving CA (Secret key ca.crt).
 	gatewayCAMountPath = "/var/run/secrets/praxis-gateway"
 	gatewayCAFileName  = "ca.crt"
 	gatewayCAVolume    = "praxis-gateway-ca"
 
-	// Mount path for the run identity (Token A) Secret. Mounted without
+	// Mount path for the selected run-identity Secret key. Mounted without
 	// subPath so kubelet Secret projection replaces the token file in place
 	// when the adapter renews it; clients must reload it.
 	runIdentityMountPath = "/var/run/secrets/run-identity"
@@ -53,7 +60,8 @@ const (
 	// observedRVFormat embeds the run-token Secret's resourceVersion in the
 	// CredentialsExpired condition message so the controller can detect
 	// renewal (a changed resourceVersion) and re-attempt the paused step.
-	observedRVFormat = "(observed resourceVersion %q)"
+	observedRVFormat       = "(observed resourceVersion %q)"
+	observedSelectorFormat = " (credential selector %q)"
 
 	ErrGetRunTokenSecret = "get run-token Secret"
 )
@@ -85,8 +93,8 @@ func spokeManagementAccess(ctx context.Context, hubClient client.Client, run *ag
 	return spokeAccessForRun(ctx, hubClient, run, operatorNS)
 }
 
-// runTokenSecretName returns the hub Secret name holding the requester's
-// original token (Token A) for the run.
+// runTokenSecretName returns the hub Secret name holding gateway credentials
+// for the run.
 func runTokenSecretName(runUID string) string {
 	return runTokenSecretPrefix + runUID
 }
@@ -98,6 +106,7 @@ func runTokenSecretName(runUID string) string {
 type credentialWaitError struct {
 	secretName string
 	secretRV   string
+	selector   string
 	reason     string
 }
 
@@ -114,33 +123,36 @@ func credentialWaitFromError(err error) *credentialWaitError {
 }
 
 // validateRunTokenSecret fetches and validates the run-token Secret for the
-// run. Fail closed: the Secret must exist, carry a non-empty token-a key,
-// and be
-// labeled with the run UID and the run's target cluster (same label
+// run. Fail closed: the Secret must exist, carry the step's non-empty token
+// key, and be labeled with the run UID and the run's target cluster (same label
 // convention as spoke-created resources) so a wrong-run or wrong-target
 // credential can never be mounted into the sandbox pod. Returns the Secret's
 // resourceVersion (never its token value) on success.
-func validateRunTokenSecret(ctx context.Context, c client.Client, namespace string, run *agenticv1alpha1.AgenticRun) (string, error) {
+func validateRunTokenSecret(ctx context.Context, c client.Client, namespace string, run *agenticv1alpha1.AgenticRun, step string, cfg *configuration.Config) (string, error) {
 	secretName := runTokenSecretName(string(run.UID))
+	_, tokenKey := gatewayCredentialForStep(step, cfg)
+	selector := credentialSelectorIdentity(step, cfg)
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", &credentialWaitError{secretName: secretName, reason: "Secret not found"}
+			return "", &credentialWaitError{secretName: secretName, selector: selector, reason: "Secret not found"}
 		}
 		return "", fmt.Errorf("%s %s: %w", ErrGetRunTokenSecret, secretName, err)
 	}
 
-	if token, ok := secret.Data[runTokenKey]; !ok || len(token) == 0 {
+	if token, ok := secret.Data[tokenKey]; !ok || len(token) == 0 {
 		return secret.ResourceVersion, &credentialWaitError{
 			secretName: secretName,
 			secretRV:   secret.ResourceVersion,
-			reason:     fmt.Sprintf("missing or empty key %q", runTokenKey),
+			selector:   selector,
+			reason:     fmt.Sprintf("missing or empty key %q", tokenKey),
 		}
 	}
 	if got, want := secret.Labels[LabelAgenticRun], string(run.UID); got != want {
 		return secret.ResourceVersion, &credentialWaitError{
 			secretName: secretName,
 			secretRV:   secret.ResourceVersion,
+			selector:   selector,
 			reason:     fmt.Sprintf("label %s = %q, want run UID %q", LabelAgenticRun, got, want),
 		}
 	}
@@ -148,6 +160,7 @@ func validateRunTokenSecret(ctx context.Context, c client.Client, namespace stri
 		return secret.ResourceVersion, &credentialWaitError{
 			secretName: secretName,
 			secretRV:   secret.ResourceVersion,
+			selector:   selector,
 			reason:     fmt.Sprintf("label %s = %q, want target cluster %q", LabelSpokeCluster, got, want),
 		}
 	}
@@ -160,7 +173,7 @@ func validateRunTokenSecret(ctx context.Context, c client.Client, namespace stri
 // targetCluster), the CA is the gateway's serving CA mounted in the pod, and
 // the bearer token is read from the run-identity token file at request time —
 // no token is embedded in the kubeconfig.
-func buildGatewaySandboxKubeconfig(serverURLTemplate, targetCluster string) ([]byte, error) {
+func buildGatewaySandboxKubeconfig(serverURLTemplate, targetCluster, tokenKey string) ([]byte, error) {
 	kc := clientcmdapi.Config{
 		Clusters: map[string]*clientcmdapi.Cluster{
 			"spoke-via-gateway": {
@@ -169,7 +182,7 @@ func buildGatewaySandboxKubeconfig(serverURLTemplate, targetCluster string) ([]b
 			},
 		},
 		AuthInfos: map[string]*clientcmdapi.AuthInfo{
-			"requester": {TokenFile: runIdentityMountPath + "/" + runTokenKey},
+			"requester": {TokenFile: runIdentityMountPath + "/" + tokenKey},
 		},
 		Contexts: map[string]*clientcmdapi.Context{
 			"spoke": {
@@ -187,12 +200,33 @@ func buildGatewaySandboxKubeconfig(serverURLTemplate, targetCluster string) ([]b
 	return data, nil
 }
 
-// mountGatewayCredentials mounts the Praxis gateway serving CA Secret and the
-// run-identity token Secret into the sandbox pod spec. Both are read-only.
-// The token Secret is mounted WITHOUT subPath so kubelet Secret projection
-// replaces the token file in place when the adapter renews it; clients must
-// reload the file rather than caching the token.
-func mountGatewayCredentials(podSpec *corev1.PodSpec, caSecretName, tokenSecretName string) {
+// gatewayCredentialForStep binds execution to the separate gateway and token
+// only when that gateway is configured; all other steps retain the read token.
+func gatewayCredentialForStep(step string, cfg *configuration.Config) (serverURLTemplate, tokenKey string) {
+	if cfg != nil {
+		serverURLTemplate = cfg.Sandbox.GatewayServerURLTemplate
+	}
+	tokenKey = runTokenKey
+	if cfg != nil && strings.EqualFold(step, string(agenticv1alpha1.SandboxStepExecution)) && cfg.Sandbox.GatewayExecutionServerURLTemplate != "" {
+		serverURLTemplate = cfg.Sandbox.GatewayExecutionServerURLTemplate
+		tokenKey = runExecutionTokenKey
+	}
+	return serverURLTemplate, tokenKey
+}
+
+// credentialSelectorIdentity captures the selected token key and a hash of
+// its endpoint template. The identity is stored in a condition message, so it
+// must not expose endpoint configuration (or credential contents).
+func credentialSelectorIdentity(step string, cfg *configuration.Config) string {
+	endpoint, tokenKey := gatewayCredentialForStep(step, cfg)
+	digest := sha256.Sum256([]byte(endpoint))
+	return tokenKey + ":" + hex.EncodeToString(digest[:])
+}
+
+// mountGatewayCredentials mounts the gateway serving CA and only the selected
+// run-identity token key. The token Secret is mounted WITHOUT subPath so
+// kubelet Secret projection replaces the file in place on renewal.
+func mountGatewayCredentials(podSpec *corev1.PodSpec, caSecretName, tokenSecretName, tokenKey string) {
 	podSpec.Volumes = append(podSpec.Volumes,
 		corev1.Volume{
 			Name: gatewayCAVolume,
@@ -203,7 +237,10 @@ func mountGatewayCredentials(podSpec *corev1.PodSpec, caSecretName, tokenSecretN
 		corev1.Volume{
 			Name: runIdentityVolume,
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: tokenSecretName},
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: tokenSecretName,
+					Items:      []corev1.KeyToPath{{Key: tokenKey, Path: tokenKey}},
+				},
 			},
 		},
 	)
@@ -239,7 +276,11 @@ func trustedTargetLabels(cfg *configuration.Config, run *agenticv1alpha1.Agentic
 // credentialPauseMessage renders a CredentialsExpired condition message that
 // embeds the observed run-token Secret resourceVersion for renewal detection.
 func credentialPauseMessage(err *credentialWaitError) string {
-	return fmt.Sprintf("%s "+observedRVFormat, err.Error(), err.secretRV)
+	message := fmt.Sprintf("%s "+observedRVFormat, err.Error(), err.secretRV)
+	if err.selector != "" {
+		message += fmt.Sprintf(observedSelectorFormat, err.selector)
+	}
+	return message
 }
 
 // observedRVFromMessage extracts the resourceVersion embedded by
@@ -252,6 +293,23 @@ func observedRVFromMessage(message string) string {
 	}
 	rest := message[idx+len("(observed resourceVersion \""):]
 	end := strings.Index(rest, "\"")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// selectorFromMessage extracts the opaque, non-secret selector identity added
+// by this controller. Older condition messages have no selector and retain
+// their resourceVersion-only resume behavior.
+func selectorFromMessage(message string) string {
+	const marker = "(credential selector \""
+	idx := strings.LastIndex(message, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := message[idx+len(marker):]
+	end := strings.Index(rest, "\")")
 	if end < 0 {
 		return ""
 	}

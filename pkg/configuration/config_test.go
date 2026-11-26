@@ -460,9 +460,10 @@ func TestParseConfigMap_CredentialModeGateway(t *testing.T) {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "test-ns"},
 		Data: map[string]string{
-			KeySandboxCredentialMode:    CredentialModeGateway,
-			KeyGatewayServerURLTemplate: "https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443",
-			KeyGatewayCASecret:          "praxis-serving-ca",
+			KeySandboxCredentialMode:             CredentialModeGateway,
+			KeyGatewayServerURLTemplate:          "https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443",
+			KeyGatewayExecutionServerURLTemplate: "https://praxis-spoke-{targetCluster}-exec.praxis-proxy.svc.cluster.local:8443",
+			KeyGatewayCASecret:                   "praxis-serving-ca",
 		},
 	}
 	cfg, err := parseConfigMap(cm)
@@ -474,6 +475,27 @@ func TestParseConfigMap_CredentialModeGateway(t *testing.T) {
 	}
 	if cfg.Sandbox.GatewayCASecret != "praxis-serving-ca" {
 		t.Errorf("GatewayCASecret = %q", cfg.Sandbox.GatewayCASecret)
+	}
+	if cfg.Sandbox.GatewayExecutionServerURLTemplate != "https://praxis-spoke-{targetCluster}-exec.praxis-proxy.svc.cluster.local:8443" {
+		t.Errorf("GatewayExecutionServerURLTemplate = %q", cfg.Sandbox.GatewayExecutionServerURLTemplate)
+	}
+}
+
+func TestParseConfigMap_CredentialModeGatewayExecutionTemplateOptional(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "test-ns"},
+		Data: map[string]string{
+			KeySandboxCredentialMode:    CredentialModeGateway,
+			KeyGatewayServerURLTemplate: "https://praxis-{targetCluster}.svc:8443",
+			KeyGatewayCASecret:          "praxis-serving-ca",
+		},
+	}
+	cfg, err := parseConfigMap(cm)
+	if err != nil {
+		t.Fatalf("gateway mode without optional execution template should parse: %v", err)
+	}
+	if cfg.Sandbox.GatewayExecutionServerURLTemplate != "" {
+		t.Errorf("GatewayExecutionServerURLTemplate = %q, want empty", cfg.Sandbox.GatewayExecutionServerURLTemplate)
 	}
 }
 

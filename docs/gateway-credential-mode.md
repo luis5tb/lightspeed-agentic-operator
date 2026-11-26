@@ -13,16 +13,25 @@ gateway** that performs an RFC 8693 token exchange per call:
 
 - The kubeconfig `server` is the gateway URL — `gateway-server-url-template`
   with `{targetCluster}` substituted by the run's immutable target cluster.
+  When `gateway-execution-server-url-template` is configured, only the
+  execution step uses that template (with the same substitution) and the
+  execution gateway; analysis, verification, and escalation continue to use
+  the read gateway.
 - The kubeconfig CA is the gateway's **serving** CA, mounted read-only from the
   Secret named by `gateway-ca-secret` (key `ca.crt`) at
   `/var/run/secrets/praxis-gateway/`.
-- The kubeconfig user has **no embedded token**; it uses
-  `tokenFile: /var/run/secrets/run-identity/token-a`, the requester's original
-  token (Token A) mounted from the run-scoped Secret `ls-run-token-{run UID}`.
-  That Secret is written by the external A2A adapter and is validated (fail
-  closed) by the operator before the pod is created: it must exist, carry the
-  `token-a` key, and be labeled `hub.openshift.io/agentic-run: {run UID}` and
-  `hub.openshift.io/spoke-cluster: {target cluster}`.
+- The kubeconfig user has **no embedded token**. Its token file is
+  `/var/run/secrets/run-identity/token-a` for analysis, verification,
+  escalation, and execution when no execution gateway template is configured.
+  With the execution template configured, the execution token file is
+  `/var/run/secrets/run-identity/token-execution`.
+- Both keys are in the run-scoped Secret `ls-run-token-{run UID}`, written by
+  the external A2A adapter. The operator validates the selected key is
+  non-empty and validates the run and target-cluster labels before creating
+  the pod. Each sandbox projects **only its selected key** (key and file path
+  are identical), so non-execution sandboxes cannot see `token-execution`.
+  The adapter writes `token-execution` only after execution approval and
+  removes it when execution ends.
 - The kubeconfig Secret machinery (`ls-sandbox-kubeconfig-{step}-{run UID}`,
   owner refs, `KUBECONFIG` env/mount) is identical to `spoke-sa` mode.
 - The sandbox pod carries the trusted-target labels
@@ -30,7 +39,11 @@ gateway** that performs an RFC 8693 token exchange per call:
   (defense-in-depth, mirroring the spoke SA labels).
 
 Required configuration (ConfigMap load fails loudly when missing):
-`gateway-server-url-template` and `gateway-ca-secret`.
+`gateway-server-url-template` and `gateway-ca-secret`. The optional
+`gateway-execution-server-url-template` selects a separate execution gateway
+and is substituted with `{targetCluster}` in the same way as the read gateway.
+When it is empty or absent, execution uses `gateway-server-url-template` and
+`token-a`, preserving the original behavior.
 
 ## No spoke management in gateway mode
 
@@ -73,22 +86,29 @@ missing `spoke-kubeconfig-hub`.
 
 ## Token renewal
 
-The run-token Secret is mounted **without subPath**, so kubelet Secret
-projection replaces the token file in place when the adapter renews it.
+The selected run-token Secret item is mounted **without subPath**, so kubelet
+Secret projection replaces the token file in place when the adapter renews it.
 Clients in the sandbox must reload the file per request (or reconnect
 long-lived transports) rather than caching the token — Secret projection
 propagation is eventually consistent.
 
 ## Credential pause (`CredentialsExpired` condition)
 
-When the run-token Secret is missing, mislabeled, or its token was
-rejected/expired, the controller sets the `CredentialsExpired` condition
-(reason `CredentialsExpired`) on the AgenticRun and does not create the pod.
+When the run-token Secret is missing, mislabeled, or lacks the non-empty key
+selected for the step (`token-a` or `token-execution`), the controller sets
+the `CredentialsExpired` condition (reason `CredentialsExpired`) on the
+AgenticRun and does not create the pod.
 The external A2A adapter watches this condition to surface `AUTH_REQUIRED` to
 the caller and rewrites `ls-run-token-{run UID}`. The controller re-attempts
 the paused step once that Secret's resourceVersion changes (the observed
 resourceVersion is embedded in the condition message; the token value is
-never logged or exposed). The condition does not participate in phase
+never logged or exposed). The condition also records the selected key and an
+opaque hash of the selected gateway endpoint. If configuration changes the
+selector while the run is paused, a valid credential for the new selector
+resumes the step without requiring an otherwise unnecessary Secret rewrite.
+Endpoint URLs and credential values are not included in this metadata. Legacy
+condition messages without selector metadata retain resourceVersion-only
+resume behavior. The condition does not participate in phase
 derivation; the step condition stays `Unknown` (in progress) while paused.
 
 Resume latency: detection of renewal is poll-based — the worst case is one

@@ -59,7 +59,7 @@ func (r *AgenticRunReconciler) pauseForCredentials(ctx context.Context, run *age
 // Without this, a mode flip would leave the run requeueing forever on a
 // credential it no longer needs, with no sandbox pod for the timeout
 // handler to observe.
-func (r *AgenticRunReconciler) resumeFromCredentialPause(ctx context.Context, run *agenticv1alpha1.AgenticRun) (bool, error) {
+func (r *AgenticRunReconciler) resumeFromCredentialPause(ctx context.Context, run *agenticv1alpha1.AgenticRun, step string) (bool, error) {
 	cond := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionCredentialsExpired)
 	if cond == nil || cond.Status != metav1.ConditionTrue {
 		return true, nil
@@ -77,16 +77,22 @@ func (r *AgenticRunReconciler) resumeFromCredentialPause(ctx context.Context, ru
 		return true, nil
 	}
 
-	rv, err := validateRunTokenSecret(ctx, r.Client, r.Namespace, run)
+	rv, err := validateRunTokenSecret(ctx, r.Client, r.Namespace, run, step, configFrom(r.Config))
 	if err != nil {
 		// Still missing or mislabeled — keep waiting. The error never
 		// carries the token value.
 		logf.FromContext(ctx).V(1).Info("run credential still not ready", "error", err.Error())
 		return false, nil
 	}
-	if rv == observedRVFromMessage(cond.Message) {
+	selectorChanged := false
+	if recorded := selectorFromMessage(cond.Message); recorded != "" {
+		selectorChanged = recorded != credentialSelectorIdentity(step, configFrom(r.Config))
+	}
+	if !selectorChanged && rv == observedRVFromMessage(cond.Message) {
 		// Secret unchanged since the pause was recorded — the renewed
-		// credential has not landed yet.
+		// credential has not landed yet. A changed selector is an
+		// independent resume signal: validation above checked the newly
+		// selected key and labels, even when the Secret RV did not change.
 		return false, nil
 	}
 

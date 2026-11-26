@@ -26,6 +26,9 @@ type SandboxConfig struct {
 	// {targetCluster} placeholder, substituted per run. Required when
 	// CredentialMode is "gateway".
 	GatewayServerURLTemplate string
+	// GatewayExecutionServerURLTemplate is an optional gateway URL template
+	// used by execution sandboxes when CredentialMode is "gateway".
+	GatewayExecutionServerURLTemplate string
 	// GatewayCASecret is the name of the Secret in the operator namespace
 	// holding the gateway serving CA under key "ca.crt". Required when
 	// CredentialMode is "gateway".
@@ -171,10 +174,11 @@ func parseConfigMap(cm *corev1.ConfigMap) (*Config, error) {
 	cfg := &Config{
 		TerminalTTLDays: parseTerminalTTLDays(cm.Data),
 		Sandbox: SandboxConfig{
-			Mode:                     cm.Data[KeySandboxMode],
-			CredentialMode:           cm.Data[KeySandboxCredentialMode],
-			GatewayServerURLTemplate: cm.Data[KeyGatewayServerURLTemplate],
-			GatewayCASecret:          cm.Data[KeyGatewayCASecret],
+			Mode:                              cm.Data[KeySandboxMode],
+			CredentialMode:                    cm.Data[KeySandboxCredentialMode],
+			GatewayServerURLTemplate:          cm.Data[KeyGatewayServerURLTemplate],
+			GatewayExecutionServerURLTemplate: cm.Data[KeyGatewayExecutionServerURLTemplate],
+			GatewayCASecret:                   cm.Data[KeyGatewayCASecret],
 		},
 		TLS: TLSConfig{
 			Profile:      cm.Data[KeyTLSProfile],

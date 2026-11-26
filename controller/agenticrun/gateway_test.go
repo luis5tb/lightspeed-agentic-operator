@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -23,18 +24,22 @@ import (
 	"github.com/openshift/lightspeed-agentic-operator/pkg/configuration"
 )
 
-func testGatewayCache(t *testing.T) *configuration.Cache {
+func testGatewayCache(t *testing.T, executionTemplate ...string) *configuration.Cache {
 	t.Helper()
 	c := &configuration.Cache{}
+	data := map[string]string{
+		configuration.KeySandboxMode:              "bare-pod",
+		configuration.KeySandboxCredentialMode:    configuration.CredentialModeGateway,
+		configuration.KeyGatewayServerURLTemplate: "https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443",
+		configuration.KeyGatewayCASecret:          "praxis-serving-ca",
+		configuration.KeySandboxPodSpec:           `{"containers":[{"name":"agent","image":"registry.example.com/agent:latest","ports":[{"containerPort":8080}]}]}`,
+	}
+	if len(executionTemplate) > 0 {
+		data[configuration.KeyGatewayExecutionServerURLTemplate] = executionTemplate[0]
+	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: configuration.ConfigMapName},
-		Data: map[string]string{
-			configuration.KeySandboxMode:              "bare-pod",
-			configuration.KeySandboxCredentialMode:    configuration.CredentialModeGateway,
-			configuration.KeyGatewayServerURLTemplate: "https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443",
-			configuration.KeyGatewayCASecret:          "praxis-serving-ca",
-			configuration.KeySandboxPodSpec:           `{"containers":[{"name":"agent","image":"registry.example.com/agent:latest","ports":[{"containerPort":8080}]}]}`,
-		},
+		Data:       data,
 	}
 	if err := c.OnConfigMapChange(context.Background(), cm); err != nil {
 		t.Fatalf("testGatewayCache: OnConfigMapChange failed: %v", err)
@@ -63,7 +68,7 @@ func testRunTokenSecret(run *agenticv1alpha1.AgenticRun, resourceVersion string)
 
 func TestBuildGatewaySandboxKubeconfig(t *testing.T) {
 	data, err := buildGatewaySandboxKubeconfig(
-		"https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443", "east-spoke")
+		"https://praxis-spoke-{targetCluster}.praxis-proxy.svc.cluster.local:8443", "east-spoke", runTokenKey)
 	if err != nil {
 		t.Fatalf("buildGatewaySandboxKubeconfig failed: %v", err)
 	}
@@ -123,7 +128,7 @@ func TestValidateRunTokenSecret_HappyPath(t *testing.T) {
 		WithObjects(testRunTokenSecret(run, "101")).
 		Build()
 
-	rv, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run)
+	rv, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run, "analysis", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -136,7 +141,7 @@ func TestValidateRunTokenSecret_Missing(t *testing.T) {
 	run := testSpokeRun()
 	fc := fake.NewClientBuilder().WithScheme(testScheme()).Build()
 
-	_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run)
+	_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run, "analysis", nil)
 	if err == nil {
 		t.Fatal("expected error for missing Secret")
 	}
@@ -152,7 +157,7 @@ func TestValidateRunTokenSecret_MissingKey(t *testing.T) {
 	delete(secret.Data, runTokenKey)
 	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(secret).Build()
 
-	_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run)
+	_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run, "analysis", nil)
 	var wait *credentialWaitError
 	if !errors.As(err, &wait) {
 		t.Fatalf("expected credentialWaitError, got %T: %v", err, err)
@@ -172,13 +177,32 @@ func TestValidateRunTokenSecret_EmptyTokenValue(t *testing.T) {
 	secret.Data[runTokenKey] = []byte{}
 	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(secret).Build()
 
-	_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run)
+	_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run, "analysis", nil)
 	var wait *credentialWaitError
 	if !errors.As(err, &wait) {
 		t.Fatalf("expected credentialWaitError, got %T: %v", err, err)
 	}
 	if !strings.Contains(wait.Error(), runTokenKey) {
 		t.Errorf("error should mention the key %q, got %q", runTokenKey, wait.Error())
+	}
+}
+
+func TestValidateRunTokenSecret_ExecutionRequiresExecutionToken(t *testing.T) {
+	run := testSpokeRun()
+	secret := testRunTokenSecret(run, "42")
+	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(secret).Build()
+	cfg := testGatewayCache(t, "https://praxis-spoke-{targetCluster}-exec.praxis-proxy.svc.cluster.local:8443").Get()
+
+	rv, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run, "execution", cfg)
+	var wait *credentialWaitError
+	if !errors.As(err, &wait) {
+		t.Fatalf("expected credentialWaitError, got %T: %v", err, err)
+	}
+	if rv != "42" || wait.secretRV != "42" {
+		t.Errorf("missing execution key resourceVersion = %q, wait RV = %q; want both 42", rv, wait.secretRV)
+	}
+	if !strings.Contains(wait.Error(), runExecutionTokenKey) {
+		t.Errorf("error should mention missing key %q, got %q", runExecutionTokenKey, wait.Error())
 	}
 }
 
@@ -208,7 +232,7 @@ func TestValidateRunTokenSecret_LabelMismatch(t *testing.T) {
 			tt.mutate(secret)
 			fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(secret).Build()
 
-			_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run)
+			_, err := validateRunTokenSecret(context.Background(), fc, "test-ns", run, "analysis", nil)
 			var wait *credentialWaitError
 			if !errors.As(err, &wait) {
 				t.Fatalf("expected credentialWaitError, got %T: %v", err, err)
@@ -222,7 +246,7 @@ func TestValidateRunTokenSecret_LabelMismatch(t *testing.T) {
 func TestMountGatewayCredentials(t *testing.T) {
 	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "agent"}}}
 
-	mountGatewayCredentials(podSpec, "praxis-serving-ca", "ls-run-token-uid")
+	mountGatewayCredentials(podSpec, "praxis-serving-ca", "ls-run-token-uid", runTokenKey)
 
 	volumes := map[string]corev1.Volume{}
 	for _, v := range podSpec.Volumes {
@@ -241,6 +265,9 @@ func TestMountGatewayCredentials(t *testing.T) {
 	}
 	if tokenVol.Secret == nil || tokenVol.Secret.SecretName != "ls-run-token-uid" {
 		t.Errorf("run-identity volume source = %v", tokenVol.VolumeSource)
+	}
+	if got := tokenVol.Secret.Items; len(got) != 1 || got[0].Key != runTokenKey || got[0].Path != runTokenKey {
+		t.Errorf("run-identity Secret items = %v, want only %s mapped to itself", got, runTokenKey)
 	}
 
 	mounts := map[string]corev1.VolumeMount{}
@@ -401,6 +428,9 @@ func TestCreate_GatewaySpokeRun(t *testing.T) {
 	if got := volumes[runIdentityVolume].Secret.SecretName; got != runTokenSecretName(string(run.UID)) {
 		t.Errorf("run-identity volume secret = %q, want %q", got, runTokenSecretName(string(run.UID)))
 	}
+	if got := volumes[runIdentityVolume].Secret.Items; len(got) != 1 || got[0].Key != runTokenKey || got[0].Path != runTokenKey {
+		t.Errorf("analysis run-identity Secret items = %v, want only %s mapped to itself", got, runTokenKey)
+	}
 	mounts := map[string]corev1.VolumeMount{}
 	for _, m := range pod.Spec.Containers[0].VolumeMounts {
 		mounts[m.Name] = m
@@ -418,6 +448,144 @@ func TestCreate_GatewaySpokeRun(t *testing.T) {
 	}
 	if !foundEnv {
 		t.Error("pod missing KUBECONFIG env var")
+	}
+}
+
+func TestCreate_GatewayNonExecutionStepsProjectReadTokenOnly(t *testing.T) {
+	for _, step := range []string{"analysis", "verification", "escalation"} {
+		t.Run(step, func(t *testing.T) {
+			run := testSpokeRun()
+			hubFC := fake.NewClientBuilder().WithScheme(testScheme()).
+				WithObjects(testReaderCRB(), testRunTokenSecret(run, "101")).Build()
+			mgr := newTestSandboxManager(hubFC, testGatewayCache(t))
+
+			name, err := mgr.Create(context.Background(), seedSandboxRun(t, mgr, run), step, testSMAgent(), testLLMForManager(), nil, 15*time.Minute, nil)
+			if err != nil {
+				t.Fatalf("Create %s sandbox failed: %v", step, err)
+			}
+			var pod corev1.Pod
+			if err := hubFC.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "test-ns"}, &pod); err != nil {
+				t.Fatalf("get sandbox pod: %v", err)
+			}
+			for _, volume := range pod.Spec.Volumes {
+				if volume.Name != runIdentityVolume {
+					continue
+				}
+				items := volume.Secret.Items
+				if len(items) != 1 || items[0].Key != runTokenKey || items[0].Path != runTokenKey {
+					t.Errorf("run-identity Secret items = %v, want only %s mapped to itself", items, runTokenKey)
+				}
+				return
+			}
+			t.Fatalf("pod missing %s volume", runIdentityVolume)
+		})
+	}
+}
+
+func TestCreate_GatewayExecutionUsesExecutionCredential(t *testing.T) {
+	run := testSpokeRun()
+	secret := testRunTokenSecret(run, "101")
+	secret.Data[runExecutionTokenKey] = []byte("execution-token-value")
+	hubFC := fake.NewClientBuilder().WithScheme(testScheme()).
+		WithObjects(testReaderCRB(), secret).Build()
+	cfg := testGatewayCache(t, "https://praxis-spoke-{targetCluster}-exec.praxis-proxy.svc.cluster.local:8443")
+	mgr := newTestSandboxManager(hubFC, cfg)
+
+	name, err := mgr.Create(context.Background(), seedSandboxRun(t, mgr, run), "execution", testSMAgent(), testLLMForManager(), nil, 15*time.Minute, nil)
+	if err != nil {
+		t.Fatalf("Create execution sandbox failed: %v", err)
+	}
+
+	var kcSecret corev1.Secret
+	if err := hubFC.Get(context.Background(), types.NamespacedName{Name: sandboxKubeconfigSecretName(string(run.UID), "execution"), Namespace: "test-ns"}, &kcSecret); err != nil {
+		t.Fatalf("get execution kubeconfig Secret: %v", err)
+	}
+	parsedKC, err := clientcmd.Load(kcSecret.Data[spokeKubeconfigFileName])
+	if err != nil {
+		t.Fatalf("parse execution kubeconfig: %v", err)
+	}
+	cluster := parsedKC.Clusters[parsedKC.Contexts[parsedKC.CurrentContext].Cluster]
+	if got, want := cluster.Server, "https://praxis-spoke-test-spoke-exec.praxis-proxy.svc.cluster.local:8443"; got != want {
+		t.Errorf("execution gateway server = %q, want %q", got, want)
+	}
+	authInfo := parsedKC.AuthInfos[parsedKC.Contexts[parsedKC.CurrentContext].AuthInfo]
+	if got, want := authInfo.TokenFile, runIdentityMountPath+"/"+runExecutionTokenKey; got != want {
+		t.Errorf("execution tokenFile = %q, want %q", got, want)
+	}
+
+	var pod corev1.Pod
+	if err := hubFC.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "test-ns"}, &pod); err != nil {
+		t.Fatalf("get execution sandbox pod: %v", err)
+	}
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name != runIdentityVolume {
+			continue
+		}
+		items := volume.Secret.Items
+		if len(items) != 1 || items[0].Key != runExecutionTokenKey || items[0].Path != runExecutionTokenKey {
+			t.Errorf("execution run-identity Secret items = %v, want only %s mapped to itself", items, runExecutionTokenKey)
+		}
+		return
+	}
+	t.Fatalf("pod missing %s volume", runIdentityVolume)
+}
+
+func TestCreate_GatewayExecutionFallsBackToReadCredentialWithoutTemplate(t *testing.T) {
+	run := testSpokeRun()
+	hubFC := fake.NewClientBuilder().WithScheme(testScheme()).
+		WithObjects(testReaderCRB(), testRunTokenSecret(run, "101")).Build()
+	mgr := newTestSandboxManager(hubFC, testGatewayCache(t))
+
+	name, err := mgr.Create(context.Background(), seedSandboxRun(t, mgr, run), "execution", testSMAgent(), testLLMForManager(), nil, 15*time.Minute, nil)
+	if err != nil {
+		t.Fatalf("Create execution sandbox failed: %v", err)
+	}
+	var kcSecret corev1.Secret
+	if err := hubFC.Get(context.Background(), types.NamespacedName{Name: sandboxKubeconfigSecretName(string(run.UID), "execution"), Namespace: "test-ns"}, &kcSecret); err != nil {
+		t.Fatalf("get execution kubeconfig Secret: %v", err)
+	}
+	parsedKC, err := clientcmd.Load(kcSecret.Data[spokeKubeconfigFileName])
+	if err != nil {
+		t.Fatalf("parse execution kubeconfig: %v", err)
+	}
+	cluster := parsedKC.Clusters[parsedKC.Contexts[parsedKC.CurrentContext].Cluster]
+	if got, want := cluster.Server, "https://praxis-spoke-test-spoke.praxis-proxy.svc.cluster.local:8443"; got != want {
+		t.Errorf("execution gateway server = %q, want %q", got, want)
+	}
+	authInfo := parsedKC.AuthInfos[parsedKC.Contexts[parsedKC.CurrentContext].AuthInfo]
+	if got, want := authInfo.TokenFile, runIdentityMountPath+"/"+runTokenKey; got != want {
+		t.Errorf("execution tokenFile = %q, want %q", got, want)
+	}
+	var pod corev1.Pod
+	if err := hubFC.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "test-ns"}, &pod); err != nil {
+		t.Fatalf("get execution sandbox pod: %v", err)
+	}
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name != runIdentityVolume {
+			continue
+		}
+		items := volume.Secret.Items
+		if len(items) != 1 || items[0].Key != runTokenKey || items[0].Path != runTokenKey {
+			t.Errorf("execution run-identity Secret items = %v, want only %s mapped to itself", items, runTokenKey)
+		}
+		return
+	}
+	t.Fatalf("pod missing %s volume", runIdentityVolume)
+}
+
+func TestCreate_GatewayExecutionMissingExecutionTokenPauses(t *testing.T) {
+	run := testSpokeRun()
+	hubFC := fake.NewClientBuilder().WithScheme(testScheme()).
+		WithObjects(testReaderCRB(), testRunTokenSecret(run, "101")).Build()
+	mgr := newTestSandboxManager(hubFC, testGatewayCache(t, "https://praxis-spoke-{targetCluster}-exec.praxis-proxy.svc.cluster.local:8443"))
+
+	_, err := mgr.Create(context.Background(), seedSandboxRun(t, mgr, run), "execution", testSMAgent(), testLLMForManager(), nil, 15*time.Minute, nil)
+	var wait *credentialWaitError
+	if !errors.As(err, &wait) {
+		t.Fatalf("expected credentialWaitError, got %T: %v", err, err)
+	}
+	if !strings.Contains(wait.Error(), runExecutionTokenKey) {
+		t.Errorf("credential wait error should identify missing key %q: %v", runExecutionTokenKey, wait)
 	}
 }
 
@@ -541,7 +709,7 @@ func TestResumeFromCredentialPause(t *testing.T) {
 			stampCredentialsExpired(t, paused, tt.pausedRV)
 			r, fc := newCredentialPauseReconciler(t, paused, objs...)
 
-			resumed, err := r.resumeFromCredentialPause(context.Background(), paused)
+			resumed, err := r.resumeFromCredentialPause(context.Background(), paused, "analysis")
 			if err != nil {
 				t.Fatalf("resumeFromCredentialPause failed: %v", err)
 			}
@@ -564,14 +732,195 @@ func TestResumeFromCredentialPause(t *testing.T) {
 	}
 }
 
+func TestResumeFromCredentialPause_ExecutionNeedsRenewedExecutionToken(t *testing.T) {
+	run := testSpokeRun()
+	cfg := testGatewayCache(t, "https://praxis-spoke-{targetCluster}-exec.praxis-proxy.svc.cluster.local:8443")
+	tests := []struct {
+		name           string
+		secretRV       string
+		includeExecKey bool
+		wantResumed    bool
+	}{
+		{name: "new resourceVersion without execution key stays paused", secretRV: "43", wantResumed: false},
+		{name: "unchanged resourceVersion with execution key stays paused", secretRV: "42", includeExecKey: true, wantResumed: false},
+		{name: "new resourceVersion with execution key resumes", secretRV: "43", includeExecKey: true, wantResumed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := testRunTokenSecret(run, tt.secretRV)
+			if tt.includeExecKey {
+				secret.Data[runExecutionTokenKey] = []byte("execution-token-value")
+			}
+			paused := run.DeepCopy()
+			stampCredentialsExpired(t, paused, "42")
+			r, _ := newCredentialPauseReconciler(t, paused, secret)
+			r.Config = cfg
+
+			resumed, err := r.resumeFromCredentialPause(context.Background(), paused, "execution")
+			if err != nil {
+				t.Fatalf("resumeFromCredentialPause failed: %v", err)
+			}
+			if resumed != tt.wantResumed {
+				t.Fatalf("resumed = %v, want %v", resumed, tt.wantResumed)
+			}
+		})
+	}
+}
+
+func TestResumeFromCredentialPause_SelectorChangeUsesNewCredentialAtSameRV(t *testing.T) {
+	run := testSpokeRun()
+	oldConfig := testGatewayCache(t, "https://praxis-spoke-{targetCluster}-exec.internal:8443")
+	selector := credentialSelectorIdentity(string(agenticv1alpha1.SandboxStepExecution), configFrom(oldConfig))
+	paused := run.DeepCopy()
+	meta.SetStatusCondition(&paused.Status.Conditions, metav1.Condition{
+		Type:   agenticv1alpha1.AgenticRunConditionCredentialsExpired,
+		Status: metav1.ConditionTrue, Reason: agenticv1alpha1.ReasonCredentialsExpired,
+		Message: credentialPauseMessage(&credentialWaitError{
+			secretName: runTokenSecretName(string(run.UID)), secretRV: "42", selector: selector,
+			reason: "missing execution credential",
+		}),
+	})
+	secret := testRunTokenSecret(run, "42")
+	secret.Data[runTokenKey] = []byte("read-token")
+	delete(secret.Data, runExecutionTokenKey)
+	r, _ := newCredentialPauseReconciler(t, paused, secret)
+	r.Config = oldConfig
+
+	// Hot-reload configuration to remove the separate execution gateway. The
+	// execution step now selects token-a at the read endpoint. It is valid at
+	// the same Secret RV, so selector change—not a Secret rewrite—must resume.
+	newConfig := testGatewayCache(t)
+	r.Config = newConfig
+	resumed, err := r.resumeFromCredentialPause(context.Background(), paused, string(agenticv1alpha1.SandboxStepExecution))
+	if err != nil {
+		t.Fatalf("resume after selector change: %v", err)
+	}
+	if !resumed {
+		t.Fatal("valid newly selected token-a did not resume at unchanged resourceVersion")
+	}
+	stored := &agenticv1alpha1.AgenticRun{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatalf("get run after selector-change resume: %v", err)
+	}
+	if credentialPauseActive(stored) {
+		t.Fatal("CredentialsExpired condition remains after selector-change resume")
+	}
+}
+
+func TestHandleVerification_CredentialPauseResumeRelaunch(t *testing.T) {
+	run := testSpokeRun()
+	run.Generation = 1
+	run.Status.Conditions = []metav1.Condition{
+		{Type: agenticv1alpha1.AgenticRunConditionAnalyzed, Status: metav1.ConditionTrue, Reason: reasonComplete, ObservedGeneration: 1},
+		{Type: agenticv1alpha1.AgenticRunConditionExecuted, Status: metav1.ConditionTrue, Reason: reasonComplete, ObservedGeneration: 1},
+	}
+	secret := testRunTokenSecret(run, "")
+	secret.Data[runTokenKey] = []byte("old-token")
+	r, fc := newCredentialPauseReconciler(t, run)
+	if err := fc.Create(context.Background(), secret); err != nil {
+		t.Fatalf("create initial run-token Secret: %v", err)
+	}
+	storedSecret := &corev1.Secret{}
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(secret), storedSecret); err != nil {
+		t.Fatalf("get initial run-token Secret: %v", err)
+	}
+	r.Config = testGatewayCache(t)
+	agent := newTestAgentCaller()
+	agent.verifyErr = &credentialWaitError{
+		secretName: runTokenSecretName(string(run.UID)), secretRV: storedSecret.ResourceVersion,
+		selector: credentialSelectorIdentity(string(agenticv1alpha1.SandboxStepVerification), configFrom(r.Config)),
+		reason:   "renewal required",
+	}
+	r.Agent = agent
+	resolved := &resolvedWorkflow{Verification: &resolvedStep{Agent: testSMAgent(), LLM: testLLMForManager()}}
+	policy := testAutoApprovePolicy()
+	currentRun := func() *agenticv1alpha1.AgenticRun {
+		t.Helper()
+		current := &agenticv1alpha1.AgenticRun{}
+		if err := fc.Get(context.Background(), client.ObjectKeyFromObject(run), current); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		return current
+	}
+
+	result, err := r.handleVerification(context.Background(), currentRun(), resolved, nil, policy)
+	if err != nil {
+		t.Fatalf("initial verification pause: %v", err)
+	}
+	if result.RequeueAfter != credentialPauseRequeueAfter {
+		t.Fatalf("initial verification pause requeue = %s", result.RequeueAfter)
+	}
+	if !credentialPauseActive(currentRun()) {
+		t.Fatal("verification should be paused pending credential renewal")
+	}
+
+	// Renewal changes the Secret RV; the next real handler pass must clear the
+	// pause, patch Verified=Unknown with a fresh optimistic-lock base, and
+	// invoke verification once more.
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(secret), storedSecret); err != nil {
+		t.Fatalf("get run-token Secret before renewal: %v", err)
+	}
+	storedSecret.Data[runTokenKey] = []byte("renewed-token")
+	if err := fc.Update(context.Background(), storedSecret); err != nil {
+		t.Fatalf("update renewed credential: %v", err)
+	}
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(secret), storedSecret); err != nil {
+		t.Fatalf("get renewed run-token Secret: %v", err)
+	}
+	if storedSecret.ResourceVersion == agent.verifyErr.(*credentialWaitError).secretRV {
+		t.Fatalf("renewal did not change Secret resourceVersion: still %q", storedSecret.ResourceVersion)
+	}
+	agent.verifyErr = nil
+	result, err = r.handleVerification(context.Background(), currentRun(), resolved, nil, policy)
+	if err != nil {
+		t.Fatalf("verification resume/relaunch: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("verification resume unexpectedly requeued: %+v", result)
+	}
+	resumed := currentRun()
+	if credentialPauseActive(resumed) {
+		t.Fatal("CredentialsExpired condition should be cleared after renewal")
+	}
+	if verified := findCondition(resumed, agenticv1alpha1.AgenticRunConditionVerified); verified == nil || verified.Status != metav1.ConditionUnknown {
+		t.Fatalf("verification was not relaunched after renewal: %+v", verified)
+	}
+
+	// A later reconcile uses a freshly read run. Verification is now already
+	// in progress, so this retry must wait for the launched sandbox rather than
+	// launching another one or recreating the credential pause.
+	retryResult, err := r.handleVerification(context.Background(), currentRun(), resolved, nil, policy)
+	if err != nil {
+		t.Fatalf("post-launch verification retry: %v", err)
+	}
+	if retryResult.Requeue || retryResult.RequeueAfter != 0 {
+		t.Fatalf("post-launch verification retry unexpectedly requeued: %+v", retryResult)
+	}
+	if agent.verifyCalls != 2 {
+		t.Fatalf("verification calls after post-launch retry = %d, want exactly 2 (initial wait + one successful launch)", agent.verifyCalls)
+	}
+	if credentialPauseActive(currentRun()) {
+		t.Fatal("post-launch verification retry recreated the credential pause")
+	}
+}
+
 func TestCredentialPauseMessage_RoundTrip(t *testing.T) {
-	waitErr := &credentialWaitError{secretName: "ls-run-token-x", secretRV: "77", reason: "missing key"}
+	waitErr := &credentialWaitError{secretName: "ls-run-token-x", secretRV: "77", selector: "token-a:abc123", reason: "missing key"}
 	msg := credentialPauseMessage(waitErr)
 	if got := observedRVFromMessage(msg); got != "77" {
 		t.Errorf("observedRVFromMessage = %q, want 77 (message %q)", got, msg)
 	}
+	if got := selectorFromMessage(msg); got != waitErr.selector {
+		t.Errorf("selectorFromMessage = %q, want %q", got, waitErr.selector)
+	}
+	if strings.Contains(msg, "praxis") || strings.Contains(msg, "token-value") {
+		t.Errorf("condition message must not expose endpoint or credential data: %q", msg)
+	}
 	if got := observedRVFromMessage("externally written message"); got != "" {
 		t.Errorf("unparseable message should yield %q, got %q", "", got)
+	}
+	if got := selectorFromMessage("legacy condition (observed resourceVersion \"77\")"); got != "" {
+		t.Errorf("legacy condition selector = %q, want absent", got)
 	}
 }
 
@@ -606,7 +955,7 @@ func TestResumeFromCredentialPause_ModeFlipToSpokeSA(t *testing.T) {
 			r, fc := newCredentialPauseReconciler(t, paused)
 			r.Config = tt.config
 
-			resumed, err := r.resumeFromCredentialPause(context.Background(), paused)
+			resumed, err := r.resumeFromCredentialPause(context.Background(), paused, "analysis")
 			if err != nil {
 				t.Fatalf("resumeFromCredentialPause failed: %v", err)
 			}
